@@ -13,6 +13,7 @@ import json
 import os
 import threading
 import time
+from pathlib import Path
 from flask import url_for
 from .util import wait_for_all_checks
 
@@ -659,3 +660,553 @@ def test_ui_watch_edit_persists_all_fields(client, live_server):
     assert watch['time_between_check']['minutes'] == 30
     assert watch['fetch_backend'] == 'html_requests'
     assert watch['method'] == 'POST'
+
+
+def test_ui_watch_edit_does_not_report_success_after_watch_write_failure(client, live_server, monkeypatch):
+    from changedetectionio import processors
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    test_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(
+        url=test_url,
+        extras={'processor': 'restock_diff', 'title': 'Original title', 'paused': True},
+    )
+    watch = datastore.data['watching'][uuid]
+    assert processors.save_processor_config(datastore, uuid, {
+        'restock_diff': {'follow_price_changes': True}
+    })
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    with open(watch_path, 'rb') as watch_file:
+        original_watch = watch_file.read()
+    real_save_entity_atomic = file_saving_datastore.save_entity_atomic
+
+    def fail_watch_save(*args, **kwargs):
+        if kwargs.get('entity_type') == 'watch':
+            raise OSError('simulated watch write failure')
+        return real_save_entity_atomic(*args, **kwargs)
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+    response = client.post(
+        url_for('ui.ui_edit.edit_page', uuid=uuid),
+        data={
+            'url': test_url,
+            'title': 'Unsaved title',
+            'processor': 'restock_diff',
+            'processor_config_restock_diff-follow_price_changes': '',
+            'tags': '',
+            'headers': '',
+            'fetch_backend': 'html_requests',
+            'time_between_check_use_default': 'y',
+        },
+        follow_redirects=True,
+    )
+
+    assert b'Processor configuration was saved' in response.data
+    assert b'Updated watch.' not in response.data
+    assert datastore.data['watching'][uuid]['title'] == 'Original title'
+    with open(watch_path, 'rb') as watch_file:
+        assert watch_file.read() == original_watch
+    with open(os.path.join(watch.data_dir, 'restock_diff.json'), encoding='utf-8') as config_file:
+        assert json.load(config_file)['restock_diff']['follow_price_changes'] is False
+
+
+def test_ui_watch_edit_does_not_report_success_after_processor_config_failure(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    test_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(
+        url=test_url,
+        extras={'processor': 'restock_diff', 'title': 'Original title', 'paused': True},
+    )
+    watch = datastore.data['watching'][uuid]
+    from changedetectionio.processors import save_processor_config
+    assert save_processor_config(datastore, uuid, {
+        'restock_diff': {'follow_price_changes': True}
+    })
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    config_path = os.path.join(watch.data_dir, 'restock_diff.json')
+    with open(watch_path, 'rb') as watch_file:
+        original_watch = watch_file.read()
+    with open(config_path, 'rb') as config_file:
+        original_config = config_file.read()
+    real_replace = file_saving_datastore.os.replace
+
+    def fail_processor_replace(source, destination):
+        if os.path.basename(destination) == 'restock_diff.json':
+            raise OSError('simulated processor config replacement failure')
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(file_saving_datastore.os, 'replace', fail_processor_replace)
+    response = client.post(
+        url_for('ui.ui_edit.edit_page', uuid=uuid),
+        data={
+            'url': test_url,
+            'title': 'Unsaved title',
+            'processor': 'restock_diff',
+            'processor_config_restock_diff-follow_price_changes': '',
+            'tags': '',
+            'headers': '',
+            'fetch_backend': 'html_requests',
+            'time_between_check_use_default': 'y',
+        },
+        follow_redirects=True,
+    )
+
+    assert b'Could not save processor configuration' in response.data
+    assert b'Updated watch.' not in response.data
+    assert datastore.data['watching'][uuid]['title'] == 'Original title'
+    with open(watch_path, 'rb') as watch_file:
+        assert watch_file.read() == original_watch
+    with open(config_path, 'rb') as config_file:
+        assert config_file.read() == original_config
+
+
+def test_ui_failed_url_update_preserves_favicon_and_edit_flag(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    old_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(url=old_url, extras={'title': 'Original title', 'paused': True})
+    watch = datastore.data['watching'][uuid]
+    watch.reset_watch_edited_flag()
+    favicon_path = os.path.join(watch.data_dir, 'favicon.ico')
+    favicon_bytes = b'cached favicon bytes'
+    with open(favicon_path, 'wb') as favicon_file:
+        favicon_file.write(favicon_bytes)
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    with open(watch_path, 'rb') as watch_file:
+        original_watch_bytes = watch_file.read()
+
+    real_save_entity_atomic = file_saving_datastore.save_entity_atomic
+
+    def fail_watch_save(*args, **kwargs):
+        if kwargs.get('entity_type') == 'watch':
+            raise OSError('simulated watch write failure')
+        return real_save_entity_atomic(*args, **kwargs)
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+    response = client.post(
+        url_for('ui.ui_edit.edit_page', uuid=uuid),
+        data={
+            'url': 'https://example.com/new-product',
+            'title': 'Unsaved title',
+            'tags': '',
+            'headers': '',
+            'fetch_backend': 'html_requests',
+            'time_between_check_use_default': 'y',
+        },
+        follow_redirects=True,
+    )
+
+    assert b'Watch settings could not be saved' in response.data
+    assert datastore.data['watching'][uuid]['url'] == old_url
+    assert datastore.data['watching'][uuid].was_edited is False
+    assert datastore.data['watching'][uuid]._pending_favicon_clear is False
+    assert open(favicon_path, 'rb').read() == favicon_bytes
+    with open(watch_path, 'rb') as watch_file:
+        assert watch_file.read() == original_watch_bytes
+
+
+def test_ui_edit_rejects_watch_deleted_before_save_lock(client, live_server):
+    """A stale edit form must report deletion without recreating watch data."""
+    import sys
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    datastore_path = datastore.datastore_path
+    app = client.application
+    watch_uuid = datastore.add_watch(
+        url=url_for('test_endpoint', _external=True),
+        extras={'title': 'Before delete', 'paused': True},
+    )
+    test_url = url_for('test_endpoint', _external=True)
+    watch = datastore.data['watching'][watch_uuid]
+    watch_dir = watch.data_dir
+    at_watch_lock = threading.Event()
+    continue_request = threading.Event()
+    request_thread_name = 'stale-ui-edit'
+
+    class RequestGateRLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+            self.request_acquisitions = 0
+
+        def __enter__(self):
+            # Deepcopy re-enters this lock through Watch.__setitem__; gate only the route's
+            # lock contexts so the deletion lands before the POST save lock is acquired.
+            if (threading.current_thread().name == request_thread_name
+                    and sys._getframe(1).f_code.co_name == 'edit_page'):
+                self.request_acquisitions += 1
+                if self.request_acquisitions == 2:
+                    at_watch_lock.set()
+                    if not continue_request.wait(10):
+                        raise AssertionError('test did not release stale UI edit')
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    watch._mutation_lock = RequestGateRLock()
+    endpoint = url_for('ui.ui_edit.edit_page', uuid=watch_uuid)
+    responses = {}
+
+    def submit_edit():
+        with app.test_client() as thread_client:
+            responses['response'] = thread_client.post(
+                endpoint,
+                data={
+                    'url': test_url,
+                    'title': 'Stale UI update',
+                    'processor': 'text_json_diff',
+                    'tags': '',
+                    'headers': '',
+                    'fetch_backend': 'html_requests',
+                    'time_between_check_use_default': 'y',
+                },
+            )
+
+    request_thread = threading.Thread(target=submit_edit, name=request_thread_name)
+    request_thread.start()
+    assert at_watch_lock.wait(10), 'UI edit did not reach the per-watch lock'
+
+    datastore.delete(watch_uuid)
+    assert watch_uuid not in datastore.data['watching']
+    assert not os.path.exists(watch_dir)
+
+    continue_request.set()
+    request_thread.join(10)
+    assert not request_thread.is_alive(), 'stale UI edit did not finish'
+    response = responses['response']
+    assert response.status_code == 302
+    assert b'Updated watch' not in response.data
+    assert watch_uuid not in datastore.data['watching']
+    assert not os.path.exists(watch_dir)
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert watch_uuid not in reloaded.data['watching']
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_tag_api_put_and_mute_report_write_failure_and_restore_state(client, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    tag_uuid = datastore.add_tag('Persistent tag')
+    tag = datastore.data['settings']['application']['tags'][tag_uuid]
+    original_title = tag['title']
+    tag_path = os.path.join(tag.data_dir, 'tag.json')
+    original_bytes = open(tag_path, 'rb').read()
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError('simulated tag write failure')
+
+    monkeypatch.setattr(tag, '_save_to_disk', fail_save)
+
+    response = client.put(
+        url_for('tag', uuid=tag_uuid),
+        data=json.dumps({'title': 'Unsaved title'}),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    assert response.status_code == 500
+    assert tag['title'] == original_title
+    assert open(tag_path, 'rb').read() == original_bytes
+
+    response = client.get(
+        url_for('tag', uuid=tag_uuid, muted='muted'),
+        headers={'x-api-key': api_key},
+    )
+    assert response.status_code == 500
+    assert tag['notification_muted'] is False
+    assert open(tag_path, 'rb').read() == original_bytes
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        restored_tag = reloaded.data['settings']['application']['tags'][tag_uuid]
+        assert restored_tag['title'] == original_title
+        assert restored_tag['notification_muted'] is False
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_ui_edit_redirects_if_watch_is_deleted_after_initial_snapshot(client, monkeypatch):
+    import changedetectionio.processors as processors
+
+    datastore = client.application.config['DATASTORE']
+    watch_uuid = datastore.add_watch(
+        url='https://example.com/ui-delete-after-snapshot',
+        extras={'paused': True},
+    )
+    watch_dir = datastore.data['watching'][watch_uuid].data_dir
+    snapshot_ready = threading.Event()
+    resume_request = threading.Event()
+    real_find_processors = processors.find_processors
+
+    def gate_after_snapshot():
+        snapshot_ready.set()
+        assert resume_request.wait(5), 'test did not release UI edit after snapshot'
+        return real_find_processors()
+
+    monkeypatch.setattr(processors, 'find_processors', gate_after_snapshot)
+    app = client.application
+    response_holder = {}
+    endpoint = url_for('ui.ui_edit.edit_page', uuid=watch_uuid)
+
+    def request_edit():
+        with app.test_client() as thread_client:
+            response_holder['response'] = thread_client.get(endpoint, follow_redirects=True)
+
+    request_thread = threading.Thread(target=request_edit)
+    request_thread.start()
+    assert snapshot_ready.wait(5), 'UI edit did not pass its initial snapshot'
+    datastore.delete(watch_uuid)
+    resume_request.set()
+    request_thread.join(10)
+
+    assert not request_thread.is_alive()
+    response = response_holder['response']
+    assert response.status_code == 200
+    assert b'This watch no longer exists' in response.data
+    assert watch_uuid not in datastore.data['watching']
+    assert not os.path.exists(watch_dir)
+
+
+def test_ui_edit_redirects_if_watch_is_replaced_before_later_lookup(client, datastore_path, monkeypatch):
+    import changedetectionio.processors as processors
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    watch_uuid = datastore.add_watch(
+        url='https://example.com/ui-replace-after-snapshot',
+        extras={'paused': True, 'title': 'Original'},
+    )
+    old_watch = datastore.data['watching'][watch_uuid]
+    replacement = datastore.rehydrate_entity(watch_uuid, dict(old_watch))
+    snapshot_ready = threading.Event()
+    resume_request = threading.Event()
+    real_find_processors = processors.find_processors
+
+    def gate_after_snapshot():
+        snapshot_ready.set()
+        assert resume_request.wait(5), 'test did not release UI edit after snapshot'
+        return real_find_processors()
+
+    monkeypatch.setattr(processors, 'find_processors', gate_after_snapshot)
+    app = client.application
+    response_holder = {}
+    endpoint = url_for('ui.ui_edit.edit_page', uuid=watch_uuid)
+
+    def request_edit():
+        with app.test_client() as thread_client:
+            response_holder['response'] = thread_client.get(endpoint, follow_redirects=True)
+
+    request_thread = threading.Thread(target=request_edit)
+    request_thread.start()
+    assert snapshot_ready.wait(5), 'UI edit did not pass its initial snapshot'
+    replacement['title'] = 'Replacement'
+    with datastore.lock:
+        datastore.data['watching'][watch_uuid] = replacement
+    assert replacement.commit() is True
+    resume_request.set()
+    request_thread.join(10)
+
+    assert not request_thread.is_alive()
+    response = response_holder['response']
+    assert response.status_code == 200
+    assert b'This watch no longer exists' in response.data
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['watching'][watch_uuid]['title'] == 'Replacement'
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_ui_edit_reports_deletion_after_commit_before_response(client, monkeypatch):
+    import changedetectionio.blueprint.browser_steps as browser_steps
+
+    datastore = client.application.config['DATASTORE']
+    watch_uuid = datastore.add_watch(
+        url='https://example.com/ui-delete-after-commit',
+        extras={'paused': True, 'title': 'Before'},
+    )
+    watch_dir = datastore.data['watching'][watch_uuid].data_dir
+    commit_finished = threading.Event()
+    resume_request = threading.Event()
+    response_holder = {}
+
+    def pause_before_response(_uuid):
+        commit_finished.set()
+        assert resume_request.wait(5), 'test did not release response after commit'
+
+    monkeypatch.setattr(browser_steps, 'cleanup_session_for_watch', pause_before_response)
+    app = client.application
+    endpoint = url_for('ui.ui_edit.edit_page', uuid=watch_uuid)
+
+    def post_edit():
+        with app.test_client() as thread_client:
+            response_holder['response'] = thread_client.post(
+                endpoint,
+                data={
+                    'url': 'https://example.com/ui-delete-after-commit',
+                    'title': 'Saved before deletion',
+                    'tags': '',
+                    'headers': '',
+                    'fetch_backend': 'html_requests',
+                    'time_between_check_use_default': 'y',
+                },
+                follow_redirects=True,
+            )
+
+    request_thread = threading.Thread(target=post_edit)
+    request_thread.start()
+    assert commit_finished.wait(10), 'UI edit did not reach post-commit response preparation'
+    assert os.path.isfile(os.path.join(watch_dir, 'watch.json'))
+    datastore.delete(watch_uuid)
+    resume_request.set()
+    request_thread.join(10)
+
+    assert not request_thread.is_alive()
+    response = response_holder['response']
+    assert response.status_code == 200
+    assert b'This watch was deleted before the edit could finish' in response.data
+    assert b'Updated watch.' not in response.data
+    assert watch_uuid not in datastore.data['watching']
+    assert not os.path.exists(watch_dir)
+
+
+def test_ui_clear_history_does_not_flash_success_when_commit_fails(client, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    watch_uuid = datastore.add_watch(
+        url='https://example.com/ui-history-clear-failure',
+        extras={'paused': True, 'title': 'Saved title', 'check_count': 4},
+    )
+    watch = datastore.data['watching'][watch_uuid]
+    watch_dir = Path(watch.data_dir)
+    history_path = watch_dir / 'history.txt'
+    snapshot_path = watch_dir / '123.txt'
+    history_path.write_bytes(b'123,123.txt\n')
+    snapshot_path.write_bytes(b'previous snapshot')
+    original_watch_json = (watch_dir / 'watch.json').read_bytes()
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError('simulated watch commit failure')
+
+    monkeypatch.setattr(watch, '_save_to_disk', fail_save)
+
+    response = client.post(
+        url_for('ui.clear_watch_history', uuid=watch_uuid),
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b'Could not clear snapshot history' in response.data
+    assert b'Cleared snapshot history for watch' not in response.data
+    assert history_path.read_bytes() == b'123,123.txt\n'
+    assert snapshot_path.read_bytes() == b'previous snapshot'
+    assert (watch_dir / 'watch.json').read_bytes() == original_watch_json
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['watching'][watch_uuid]['title'] == 'Saved title'
+        assert (Path(reloaded.data['watching'][watch_uuid].data_dir) / '123.txt').read_bytes() == b'previous snapshot'
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_bulk_clear_history_reports_failed_watches(client, monkeypatch):
+    from threading import Event
+    from changedetectionio.blueprint import ui as ui_module
+
+    datastore = client.application.config['DATASTORE']
+    first_uuid = datastore.add_watch(url='https://example.com/bulk-history-clear-first')
+    failed_uuid = datastore.add_watch(url='https://example.com/bulk-history-clear-failed')
+    calls = []
+    completed = Event()
+    captured_logs = []
+    original_clear = datastore.clear_watch_history
+    original_error = ui_module.logger.error
+
+    def partial_clear(uuid, *args, **kwargs):
+        calls.append(uuid)
+        result = uuid != failed_uuid
+        if len(calls) == 2:
+            completed.set()
+        if result:
+            return original_clear(uuid, *args, **kwargs)
+        return False
+
+    def capture_error(message, *args, **kwargs):
+        if 'Background: Cleared history for' in str(message):
+            captured_logs.append(str(message))
+        return original_error(message, *args, **kwargs)
+
+    monkeypatch.setattr(datastore, 'clear_watch_history', partial_clear)
+    monkeypatch.setattr(ui_module.logger, 'error', capture_error)
+
+    response = client.post(
+        url_for('ui.clear_all_history'),
+        data={'confirmtext': 'clear'},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b'History clearing started in background' in response.data
+    assert completed.wait(5), 'bulk clear worker did not finish processing both watches'
+    for _ in range(50):
+        if captured_logs:
+            break
+        time.sleep(0.01)
+    assert len(calls) == 2
+    assert captured_logs
+    assert '1/2' in captured_logs[0]
+    assert failed_uuid in captured_logs[0]
+    assert first_uuid in calls
+
+
+def test_processor_switch_does_not_report_success_when_history_clear_fails(client, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    watch_uuid = datastore.add_watch(
+        url='https://example.com/processor-switch-clear-failure',
+        extras={'paused': True, 'processor': 'text_json_diff'},
+    )
+    watch = datastore.data['watching'][watch_uuid]
+    watch_dir = Path(watch.data_dir)
+    history_path = watch_dir / 'history.txt'
+    history_path.write_bytes(b'123,123.txt\n')
+    (watch_dir / '123.txt').write_bytes(b'previous snapshot')
+    original_watch_json = (watch_dir / 'watch.json').read_bytes()
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError('simulated processor switch persistence failure')
+
+    monkeypatch.setattr(watch, '_save_to_disk', fail_save)
+
+    response = client.get(
+        url_for('ui.ui_edit.edit_page', uuid=watch_uuid, switch_processor='restock_diff'),
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b'Could not save the processor change or clear its history' in response.data
+    assert b'Switched to mode' not in response.data
+    assert watch['processor'] == 'text_json_diff'
+    assert history_path.read_bytes() == b'123,123.txt\n'
+    assert (watch_dir / '123.txt').read_bytes() == b'previous snapshot'
+    assert (watch_dir / 'watch.json').read_bytes() == original_watch_json
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['watching'][watch_uuid]['processor'] == 'text_json_diff'
+        assert (Path(reloaded.data['watching'][watch_uuid].data_dir) / '123.txt').read_bytes() == b'previous snapshot'
+    finally:
+        reloaded.stop_thread = True

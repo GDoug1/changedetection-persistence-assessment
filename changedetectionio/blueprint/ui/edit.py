@@ -79,14 +79,18 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         from changedetectionio import processors
         import importlib
 
-        if uuid == 'first':
-            uuid = list(datastore.data['watching'].keys()).pop()
+        with datastore.lock:
+            watch_uuids = list(datastore.data['watching'].keys())
+            if uuid == 'first' and watch_uuids:
+                uuid = watch_uuids[-1]
+            watch_obj = datastore.data['watching'].get(uuid)
+
         # More for testing, possible to return the first/only
-        if not datastore.data['watching'].keys():
+        if not watch_uuids:
             flash(gettext("No watches to edit"), "error")
             return redirect(url_for('watchlist.index'))
 
-        if not uuid in datastore.data['watching']:
+        if not watch_obj:
             flash(gettext("No watch with the UUID {} found.").format(uuid), "error")
             return redirect(url_for('watchlist.index'))
 
@@ -94,19 +98,21 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         if switch_processor:
             for p in processors.available_processors():
                 if p[0] == switch_processor:
-                    datastore.data['watching'][uuid]['processor'] = switch_processor
+                    def switch_processor_config(watch):
+                        watch['processor'] = switch_processor
+
+                    if not datastore.clear_watch_history(uuid, mutation=switch_processor_config):
+                        flash(gettext("Could not save the processor change or clear its history."), "error")
+                        return redirect(url_for('watchlist.index'))
                     flash(gettext("Switched to mode - {}.").format(p[1]))
-                    datastore.clear_watch_history(uuid)
-                    redirect(url_for('ui_edit.edit_page', uuid=uuid))
+                    return redirect(url_for('ui_edit.edit_page', uuid=uuid))
 
         # be sure we update with a copy instead of accidently editing the live object by reference
-        default = None
-        while not default:
-            try:
-                default = deepcopy(datastore.data['watching'][uuid])
-            except RuntimeError as e:
-                # Dictionary changed
-                continue
+        with watch_obj.mutation_lock:
+            if not datastore.is_watch_current(uuid, watch_obj):
+                flash(gettext("This watch no longer exists. It may have been deleted while you were editing it."), "error")
+                return redirect(url_for('watchlist.index'))
+            default = deepcopy(watch_obj)
 
         # Defaults for proxy choice
         if datastore.proxy_list is not None:  # When enabled
@@ -117,7 +123,7 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
         # proxy_override set to the json/text list of the items
 
         # Does it use some custom form? does one exist?
-        processor_name = datastore.data['watching'][uuid].get('processor', '')
+        processor_name = default.get('processor', '')
         processor_classes = next((tpl for tpl in processors.find_processors() if tpl[1] == processor_name), None)
         if not processor_classes:
             flash(gettext("Could not load '{}' processor, processor plugin might be missing. Please select a different processor.").format(processor_name), 'error')
@@ -219,62 +225,94 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             # Handle processor-config-* fields separately (save to JSON, not datastore)
             # IMPORTANT: These must NOT be saved to url-watches.json, only to the processor-specific JSON file
             processor_config_data = processors.extract_processor_config_from_form_data(form.data)
-            processors.save_processor_config(datastore, uuid, processor_config_data)
+            original_watch = watch_obj
+            saved_watch = None
 
-            # Ignore text
-            form_ignore_text = form.ignore_text.data
-            datastore.data['watching'][uuid]['ignore_text'] = form_ignore_text
+            with original_watch.mutation_lock:
+                if not datastore.is_watch_current(uuid, original_watch):
+                    flash(gettext("This watch no longer exists. It may have been deleted while you were editing it."), "error")
+                    return redirect(url_for('watchlist.index'))
 
-            # Be sure proxy value is None
-            if datastore.proxy_list is not None and form.data['proxy'] == '':
-                extra_update_obj['proxy'] = None
+                previous_watch_state = original_watch.snapshot_for_rollback()
 
-            # Unsetting all filter_text methods should make it go back to default
-            # This particularly affects tests running
-            if 'filter_text_added' in form.data and not form.data.get('filter_text_added') \
-                    and 'filter_text_replaced' in form.data and not form.data.get('filter_text_replaced') \
-                    and 'filter_text_removed' in form.data and not form.data.get('filter_text_removed'):
-                extra_update_obj['filter_text_added'] = True
-                extra_update_obj['filter_text_replaced'] = True
-                extra_update_obj['filter_text_removed'] = True
+                if not processors.save_processor_config(datastore, uuid, processor_config_data):
+                    flash(gettext("Could not save processor configuration. Watch changes were not saved."), "error")
+                    return redirect(request.url)
 
-            # A group that has taken the AI on/off decision owns that control, so the edit page
-            # renders it disabled (see include_llm_intent.html). A disabled checkbox isn't
-            # submitted at all, and for a checkbox "not submitted" is indistinguishable from
-            # "unticked" — so don't take this field from the form while a group decides. The
-            # watch keeps its own preference untouched, ready for when the group stops deciding.
-            # Resolved against the watch's *stored* tags — i.e. what the page was rendered from,
-            # so attaching or detaching a group in this same save is still honoured correctly.
-            if _resolve_llm_group_overrides(datastore.data['watching'][uuid], datastore).get('llm_backend_profile'):
-                extra_update_obj['llm_backend_profile'] = datastore.data['watching'][uuid].get('llm_backend_profile', True)
+                # Ignore text
+                form_ignore_text = form.ignore_text.data
+                original_watch['ignore_text'] = form_ignore_text
 
-            # Because wtforms doesn't support accessing other data in process_ , but we convert the CSV list of tags back to a list of UUIDs
-            tag_uuids = []
-            if form.data.get('tags'):
-                # Sometimes in testing this can be list, dont know why
-                if type(form.data.get('tags')) == list:
-                    extra_update_obj['tags'] = form.data.get('tags')
-                else:
-                    for t in form.data.get('tags').split(','):
-                        tag_uuids.append(datastore.add_tag(title=t))
-                    extra_update_obj['tags'] = tag_uuids
+                # Be sure proxy value is None
+                if datastore.proxy_list is not None and form.data['proxy'] == '':
+                    extra_update_obj['proxy'] = None
 
-            datastore.data['watching'][uuid].update(form.data)
-            datastore.data['watching'][uuid].update(extra_update_obj)
+                # Unsetting all filter_text methods should make it go back to default
+                # This particularly affects tests running
+                if 'filter_text_added' in form.data and not form.data.get('filter_text_added') \
+                        and 'filter_text_replaced' in form.data and not form.data.get('filter_text_replaced') \
+                        and 'filter_text_removed' in form.data and not form.data.get('filter_text_removed'):
+                    extra_update_obj['filter_text_added'] = True
+                    extra_update_obj['filter_text_replaced'] = True
+                    extra_update_obj['filter_text_removed'] = True
 
-            if not datastore.data['watching'][uuid].get('tags'):
-                # Force it to be a list, because form.data['tags'] will be string if nothing found
-                # And del(form.data['tags'] ) wont work either for some reason
-                datastore.data['watching'][uuid]['tags'] = []
+                # A group that has taken the AI on/off decision owns that control, so the edit page
+                # renders it disabled (see include_llm_intent.html). A disabled checkbox isn't
+                # submitted at all, and for a checkbox "not submitted" is indistinguishable from
+                # "unticked" — so don't take this field from the form while a group decides. The
+                # watch keeps its own preference untouched, ready for when the group stops deciding.
+                # Resolved against the watch's *stored* tags — i.e. what the page was rendered from,
+                # so attaching or detaching a group in this same save is still honoured correctly.
+                if _resolve_llm_group_overrides(original_watch, datastore).get('llm_backend_profile'):
+                    extra_update_obj['llm_backend_profile'] = original_watch.get('llm_backend_profile', True)
 
-            # Recast it if need be to right data Watch handler
-            watch_class = processors.get_custom_watch_obj_for_processor(form.data.get('processor'))
-            datastore.data['watching'][uuid] = watch_class(datastore_path=datastore.datastore_path, __datastore=datastore.data, default=datastore.data['watching'][uuid])
+                # Because wtforms doesn't support accessing other data in process_ , but we convert the CSV list of tags back to a list of UUIDs
+                tag_uuids = []
+                if form.data.get('tags'):
+                    # Sometimes in testing this can be list, dont know why
+                    if type(form.data.get('tags')) == list:
+                        extra_update_obj['tags'] = form.data.get('tags')
+                    else:
+                        for t in form.data.get('tags').split(','):
+                            tag_uuids.append(datastore.add_tag(title=t))
+                        extra_update_obj['tags'] = tag_uuids
 
-            # Save the watch immediately
-            datastore.data['watching'][uuid].commit()
+                original_watch.update(form.data)
+                original_watch.update(extra_update_obj)
 
-            flash(gettext("Updated watch - unpaused!") if request.args.get('unpause_on_save') else gettext("Updated watch."))
+                if not original_watch.get('tags'):
+                    # Force it to be a list, because form.data['tags'] will be string if nothing found
+                    # And del(form.data['tags'] ) wont work either for some reason
+                    original_watch['tags'] = []
+
+                # Recast it if need be to right data Watch handler
+                watch_class = processors.get_custom_watch_obj_for_processor(form.data.get('processor'))
+                with datastore.lock:
+                    if datastore.data['watching'].get(uuid) is not original_watch:
+                        original_watch.restore_after_failed_commit(previous_watch_state)
+                        flash(gettext("This watch no longer exists. It may have been deleted while you were editing it."), "error")
+                        return redirect(url_for('watchlist.index'))
+                    saved_watch = watch_class(
+                        datastore_path=datastore.datastore_path,
+                        __datastore=datastore.data,
+                        __datastore_owner=datastore,
+                        default=original_watch,
+                    )
+                    datastore.data['watching'][uuid] = saved_watch
+
+                # Save the watch immediately
+                if not saved_watch.commit():
+                    original_watch.restore_after_failed_commit(previous_watch_state)
+                    with datastore.lock:
+                        if datastore.data['watching'].get(uuid) is saved_watch:
+                            datastore.data['watching'][uuid] = original_watch
+                    if processor_config_data:
+                        error_message = gettext("Processor configuration was saved, but watch settings could not be saved. Watch settings were restored in memory; please retry.")
+                    else:
+                        error_message = gettext("Watch settings could not be saved. Previous settings were restored in memory; please retry.")
+                    flash(error_message, "error")
+                    return redirect(request.url)
+
 
             # Cleanup any browsersteps session for this watch
             try:
@@ -287,7 +325,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
             # @todo maybe it should never queue anyway on edit...
             is_in_schedule = True
-            watch = datastore.data['watching'].get(uuid)
+            watch = saved_watch
+            if not datastore.is_watch_current(uuid, watch):
+                flash(gettext("This watch was deleted before the edit could finish."), "error")
+                return redirect(url_for('watchlist.index'))
 
             if watch.get('time_between_check_use_default'):
                 time_schedule_limit = datastore.data['settings']['requests'].get('time_schedule_limit') or {}
@@ -313,9 +354,11 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
                     is_in_schedule = False
 
             #############################
-            if not datastore.data['watching'][uuid].get('paused') and is_in_schedule:
+            if not watch.get('paused') and is_in_schedule:
                 # Queue the watch for immediate recheck, with a higher priority
                 worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+
+            flash(gettext("Updated watch - unpaused!") if request.args.get('unpause_on_save') else gettext("Updated watch."))
 
             # Diff page [edit] link should go back to diff page
             if request.args.get("next") and request.args.get("next") == 'diff':
@@ -334,7 +377,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             except ModuleNotFoundError:
                 jq_support = False
 
-            watch = datastore.data['watching'].get(uuid)
+            if not datastore.is_watch_current(uuid, watch_obj):
+                flash(gettext("This watch no longer exists. It may have been deleted while you were editing it."), "error")
+                return redirect(url_for('watchlist.index'))
+            watch = watch_obj
 
             from zoneinfo import available_timezones
 
@@ -515,20 +561,22 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
             # the "content unchanged since last check" skip stays active — the new
             # ignore_text would then not take effect until the page changed on its
             # own. Assigning the key marks the watch edited and forces reprocessing.
-            ignore_text = list(datastore.data["watching"][uuid]['ignore_text'])
+            additions = []
             if mode == 'exact':
                 for l in selection.splitlines():
-                    ignore_text.append(l.strip())
+                    additions.append(l.strip())
             elif mode == 'digit-regex':
                 for l in selection.splitlines():
                     # Replace any series of numbers with a regex
                     s = re.escape(l.strip())
                     s = re.sub(r'[0-9]+', r'\\d+', s)
-                    ignore_text.append('/' + s + '/')
-            datastore.data["watching"][uuid]['ignore_text'] = ignore_text
+                    additions.append('/' + s + '/')
 
-            # Save the updated ignore_text
-            datastore.data["watching"][uuid].commit()
+            def add_ignore_text(watch):
+                watch['ignore_text'] = list(watch['ignore_text']) + additions
+
+            if not datastore.mutate_watch(uuid, add_ignore_text):
+                return gettext("Could not save ignore text because the watch was changed or deleted."), 500
 
         return f"<a href={url_for('ui.ui_preview.preview_page', uuid=uuid)}>Click to preview</a>"
     

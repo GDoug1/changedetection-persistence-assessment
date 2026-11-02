@@ -7,6 +7,7 @@ from changedetectionio import worker_pool
 from changedetectionio.queuedWatchMetaData import PrioritizedItem
 from changedetectionio.pluggy_interface import apply_update_handler_alter, apply_update_finalize
 from changedetectionio import gc_debounce
+from changedetectionio.model.Watch import bind_current_check_result, reset_current_check_result
 
 import asyncio
 import os
@@ -70,6 +71,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
     jobs_processed = 0
     start_time = time.time()
+    restart_after_cleanup = False
 
     # Log thread name for debugging
     import threading
@@ -77,9 +79,18 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
     logger.info(f"Starting async worker {worker_id} on thread '{thread_name}' (max_jobs={max_jobs}, max_runtime={max_runtime_seconds}s)")
 
     while not app.config.exit.is_set():
+        if restart_after_cleanup:
+            return "restart"
+        restart_after_cleanup = False
         update_handler = None
         finalize_handler = None  # The handler update_finalize gets, see below
         watch = None
+        uuid = None
+        check_token = None
+        check_context_token = None
+        watch_result_lock_held = False
+        notify_after_result = False
+        result_metadata_committed = False
         processing_exception = None  # Reset at start of each iteration to prevent state bleeding
 
         try:
@@ -146,17 +157,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
         fetch_start_time = round(time.time())
 
         try:
-            if uuid in list(datastore.data['watching'].keys()) and datastore.data['watching'][uuid].get('url'):
+            watch, check_token = datastore.begin_watch_check(uuid, fetch_start_time)
+            if watch is not None and watch.get('url'):
+                check_context_token = bind_current_check_result(watch, check_token)
                 changed_detected = False
                 contents = b''
                 process_changedetection_results = True
                 update_obj = {}
-
-                # Clear last errors
-                datastore.data['watching'][uuid]['browser_steps_last_error_step'] = None
-                datastore.data['watching'][uuid]['last_checked'] = fetch_start_time
-
-                watch = datastore.data['watching'].get(uuid)
 
                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
 
@@ -323,7 +330,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     watch.reset_watch_edited_flag()
                     # Page was fetched successfully - clear any previous error state
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': False})
-                    cleanup_error_artifacts(uuid, datastore)
+                    cleanup_error_artifacts(uuid, datastore, watch=watch, check_token=check_token)
                     
                 except content_fetchers_exceptions.BrowserConnectError as e:
                     datastore.update_watch(uuid=uuid,
@@ -432,7 +439,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     update_obj['consecutive_filter_failures'] = 0
 
                     update_obj['last_error'] = False
-                    cleanup_error_artifacts(uuid, datastore)
+                    cleanup_error_artifacts(uuid, datastore, watch=watch, check_token=check_token)
 
                 if not datastore.data['watching'].get(uuid):
                     continue
@@ -440,9 +447,6 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 logger.debug(f"Processing watch UUID: {uuid} - xpath_data length returned {len(update_handler.xpath_data) if update_handler and update_handler.xpath_data else 'empty.'}")
                 if update_handler and process_changedetection_results:
                     try:
-                        # Reset the edited flag BEFORE update_watch (which calls watch.update() and would set it again)
-                        watch.reset_watch_edited_flag()
-
                         # LLM evaluation — intent filtering + change summary
                         update_obj['_llm_result'] = None
                         update_obj['_llm_intent'] = ''
@@ -545,9 +549,23 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                             except Exception as e:
                                 logger.warning(f"LLM evaluation error for {uuid}: {e}")
 
-                        datastore.update_watch(uuid=uuid, update_obj=update_obj)
-
-                        if changed_detected or not watch.history_n:
+                        needs_snapshot = changed_detected or not watch.history_n
+                        if needs_snapshot:
+                            if watch.newest_history_key and int(fetch_start_time) == int(watch.newest_history_key):
+                                logger.warning(f"Timestamp {fetch_start_time} already exists; advancing timestamp")
+                                fetch_start_time += 1
+                            result_metadata = dict(update_obj)
+                            result_metadata['check_count'] = watch.get('check_count', 0) + 1
+                            result_metadata['fetch_time'] = round(time.time() - fetch_start_time, 3)
+                            if not datastore.apply_watch_result(
+                                    uuid=uuid, watch=watch, token=check_token,
+                                    update_obj=result_metadata, contents=contents,
+                                    timestamp=int(fetch_start_time),
+                                    snapshot_id=update_obj.get('previous_md5', 'none')):
+                                logger.warning(f"Could not persist check result for watch {uuid}; result discarded")
+                                continue
+                            result_metadata_committed = True
+                            watch.reset_watch_edited_flag()
                             if update_handler.screenshot:
                                 watch.save_screenshot(screenshot=update_handler.screenshot)
                                 # Free screenshot memory immediately after saving
@@ -561,16 +579,6 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                 update_handler.xpath_data = None
                                 if hasattr(update_handler, 'fetcher') and hasattr(update_handler.fetcher, 'xpath_data'):
                                     update_handler.fetcher.xpath_data = None
-
-                            # Ensure unique timestamp for history
-                            if watch.newest_history_key and int(fetch_start_time) == int(watch.newest_history_key):
-                                logger.warning(f"Timestamp {fetch_start_time} already exists, waiting 1 seconds")
-                                fetch_start_time += 1
-                                await asyncio.sleep(1)
-
-                            watch.save_history_blob(contents=contents,
-                                                    timestamp=int(fetch_start_time),
-                                                    snapshot_id=update_obj.get('previous_md5', 'none'))
 
                             # Save AI summary file now that the new snapshot is committed —
                             # watch.history.keys()[-1] now reflects the just-saved version,
@@ -614,7 +622,12 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                             if watch.history_n >= 2:
                                 logger.info(f"Change detected in UUID {uuid} - {watch['url']}")
                                 if not watch.get('notification_muted'):
-                                    await send_content_changed_notification(uuid, notification_q, datastore)
+                                    notify_after_result = True
+                        else:
+                            if not datastore.update_watch(uuid=uuid, update_obj=update_obj):
+                                logger.warning(f"Could not persist unchanged check metadata for watch {uuid}")
+                                continue
+                            result_metadata_committed = True
 
                     except Exception as e:
 
@@ -624,7 +637,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
 
                 # Always record attempt count
-                count = watch.get('check_count', 0) + 1
+                count = watch.get('check_count', 0) + (0 if result_metadata_committed else 1)
 
                 final_updates = {'fetch_time': round(time.time() - fetch_start_time, 3),
                                                                   'check_count': count,
@@ -658,7 +671,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                            mime_type=update_handler.fetcher.favicon_blob.get('mime_type')
                                            )
 
-                    datastore.update_watch(uuid=uuid, update_obj=final_updates)
+                    if not datastore.update_watch(uuid=uuid, update_obj=final_updates):
+                        logger.warning(f"Could not persist final check metadata for watch {uuid}")
+                        notify_after_result = False
+
+                    if watch_result_lock_held:
+                        datastore.end_watch_result_application(watch)
+                        watch_result_lock_held = False
+                    if notify_after_result:
+                        await send_content_changed_notification(uuid, notification_q, datastore)
 
                     # NOW clear fetcher content - after all processing is complete
                     # This is the last point where we need the fetcher data
@@ -686,6 +707,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
         
         finally:
             # Always cleanup - this runs whether there was an exception or not
+            if watch_result_lock_held and watch is not None:
+                datastore.end_watch_result_application(watch)
+                watch_result_lock_held = False
             if uuid:
                 # Capture references for plugin finalize hook BEFORE cleanup
                 # (cleanup may delete these variables, but plugins need the original references)
@@ -754,6 +778,10 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         watch_check_update = signal('watch_check_update')
                         watch_check_update.send(watch_uuid=watch['uuid'])
 
+            if check_context_token is not None:
+                reset_current_check_result(check_context_token)
+                check_context_token = None
+
             del (uuid)
 
             # Brief pause before continuing to avoid tight error loops (only on error)
@@ -774,7 +802,10 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
             if should_restart_jobs or should_restart_time:
                 reason = f"{jobs_processed} jobs" if should_restart_jobs else f"{runtime:.0f}s runtime"
                 logger.info(f"Worker {worker_id} restarting after {reason} ({jobs_processed} jobs, {runtime:.0f}s runtime)")
-                return "restart"
+                restart_after_cleanup = True
+
+        if restart_after_cleanup:
+            return "restart"
 
         # Check if we should exit
         if app.config.exit.is_set():
@@ -790,13 +821,25 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
     return "shutdown"
 
 
-def cleanup_error_artifacts(uuid, datastore):
-    """Helper function to clean up error artifacts"""
+def cleanup_error_artifacts(uuid, datastore, watch=None, check_token=None):
+    """Remove error sidecars only while the exact check result is still current."""
+    if watch is None:
+        with datastore.lock:
+            watch = datastore.data['watching'].get(uuid)
+    if watch is None:
+        return False
+
     cleanup_files = ["last-error-screenshot.png", "last-error.txt"]
-    for f in cleanup_files:
-        full_path = os.path.join(datastore.datastore_path, uuid, f)
-        if os.path.isfile(full_path):
-            os.unlink(full_path)
+    with watch.mutation_lock:
+        if not datastore.is_watch_current(uuid, watch):
+            return False
+        if check_token is not None and not datastore.is_watch_check_token_current(uuid, watch, check_token):
+            return False
+        for f in cleanup_files:
+            full_path = os.path.join(datastore.datastore_path, uuid, f)
+            if os.path.isfile(full_path):
+                os.unlink(full_path)
+    return True
 
 
 

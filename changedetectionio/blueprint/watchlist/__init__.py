@@ -25,16 +25,20 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
     def toggle():
         op = request.args.get('op')
         uuid = request.args.get('uuid')
-        watch = datastore.data['watching'].get(uuid)
+        with datastore.lock:
+            watch = datastore.data['watching'].get(uuid)
 
         if not watch:
             flash(_('Watch not found'), 'error')
         else:
-            if op == 'pause':
-                watch.toggle_pause()
-            elif op == 'mute':
-                watch.toggle_mute()
-            watch.commit()
+            def toggle_watch(current):
+                if op == 'pause':
+                    current.toggle_pause()
+                elif op == 'mute':
+                    current.toggle_mute()
+
+            if not datastore.mutate_watch(uuid, toggle_watch):
+                flash(_('Could not save the watch change. It may have been deleted.'), 'error')
 
         return redirect(url_for('watchlist.index', tag=request.args.get('tag')))
 

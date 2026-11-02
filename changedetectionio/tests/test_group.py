@@ -163,7 +163,7 @@ def test_tag_add_in_ui(client, live_server, measure_memory_usage, datastore_path
     assert b"new-test-tag" in res.data
 
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
     delete_all_watches(client)
 
@@ -273,7 +273,7 @@ def test_limit_tag_ui(client, live_server, measure_memory_usage, datastore_path)
 
     delete_all_watches(client)
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
 def test_clone_tag_on_import(client, live_server, measure_memory_usage, datastore_path):
     
@@ -328,7 +328,7 @@ def test_clone_tag_on_quickwatchform_add(client, live_server, measure_memory_usa
     delete_all_watches(client)
 
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
 def test_order_of_filters_tag_filter_and_watch_filter(client, live_server, measure_memory_usage, datastore_path):
 
@@ -552,7 +552,13 @@ def test_tag_json_persistence(client, live_server, measure_memory_usage, datasto
 
     # 8. Delete the tag via API
     res = client.post(url_for("tags.delete", uuid=tag_uuid), follow_redirects=True)
-    assert b"Tag deleted" in res.data
+    assert b"Removing tag references and configuration in background" in res.data
+
+    for _ in range(100):
+        if (tag_uuid not in datastore.data['settings']['application']['tags']
+                and not os.path.exists(tag_json_path)):
+            break
+        time.sleep(0.05)
 
     # 9. Verify tag.json file was deleted
     assert not os.path.exists(tag_json_path), f"tag.json should be deleted at {tag_json_path}"
@@ -608,9 +614,13 @@ def test_tag_json_migration_update_27(client, live_server, measure_memory_usage,
 
     # Cleanup
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
     # Verify all tag.json files were deleted
+    for _ in range(100):
+        if all(not os.path.exists(os.path.join(datastore_path, tag_uuid, "tag.json")) for tag_uuid in tag_uuids):
+            break
+        time.sleep(0.05)
     for tag_uuid in tag_uuids:
         tag_json_path = os.path.join(datastore_path, tag_uuid, "tag.json")
         assert not os.path.exists(tag_json_path), f"tag.json should be deleted for {tag_uuid}"

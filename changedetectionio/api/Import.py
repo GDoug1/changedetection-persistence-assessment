@@ -4,7 +4,9 @@ from flask import request
 from functools import wraps
 from . import auth, validate_openapi_request
 from ..validate_url import is_safe_valid_url
+from loguru import logger
 import json
+from urllib.parse import urlsplit, urlunsplit
 
 # Number of URLs above which import switches to background processing
 IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD = 20
@@ -12,6 +14,66 @@ IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD = 20
 # Query params whose accepted values are wider than the `enum:` in the spec and are checked
 # separately further down (plugin processors aren't listed in the static spec enum).
 ENUM_VALIDATED_ELSEWHERE = {'processor'}
+
+
+def _redact_import_url(url):
+    """Keep useful URL context while omitting credentials, query, and fragment data."""
+    try:
+        parts = urlsplit(str(url))
+        host = parts.hostname or ''
+        if ':' in host and not host.startswith('['):
+            host = f'[{host}]'
+        if parts.port:
+            host = f'{host}:{parts.port}'
+        return urlunsplit((parts.scheme, host, parts.path, '', ''))
+    except (TypeError, ValueError):
+        return '<invalid URL>'
+
+
+def _import_watch_batch(datastore, urls, extras, tags, tag_uuids):
+    """Persist an import batch and retain per-URL results for both API modes."""
+    added = []
+    failed = []
+
+    for url in urls:
+        try:
+            watch_uuid, watch_saved, cleanup_complete = datastore.add_watch(
+                url=url,
+                extras=extras,
+                tag=tags,
+                tag_uuids=tag_uuids,
+                save_immediately=True,
+                return_commit_status=True,
+            )
+        except Exception as e:
+            logger.error(f"Import watch creation failed for {_redact_import_url(url)} ({type(e).__name__})")
+            failed.append({
+                'url': _redact_import_url(url),
+                'uuid': None,
+                'error': 'Watch creation failed',
+                'cleanup_complete': False,
+            })
+            continue
+
+        if watch_uuid and watch_saved:
+            added.append(watch_uuid)
+            continue
+
+        failed.append({
+            'url': _redact_import_url(url),
+            'uuid': watch_uuid,
+            'error': 'Watch creation failed',
+            'cleanup_complete': cleanup_complete,
+        })
+
+    return {
+        'status': 'completed' if not failed else ('partial_failure' if added else 'failed'),
+        'requested_count': len(urls),
+        'success_count': len(added),
+        'failure_count': len(failed),
+        'added': added,
+        'failed': failed,
+    }
 
 
 def default_content_type(content_type='text/plain'):
@@ -203,7 +265,7 @@ class Import(Resource):
 
             # Validate URL
             if not is_safe_valid_url(url):
-                return f"Invalid or unsupported URL - {url}", 400
+                return f"Invalid or unsupported URL - {_redact_import_url(url)}", 400
 
             # Check for duplicates if dedupe is enabled
             if dedupe and self.datastore.url_exists(url):
@@ -222,34 +284,42 @@ class Import(Resource):
 
         # For small imports, process synchronously for immediate feedback
         if len(urls_to_import) < IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD:
-            added = []
-            for url in urls_to_import:
-                new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags, tag_uuids=tag_uuids)
-                added.append(new_uuid)
-            return added, 200
+            result = _import_watch_batch(self.datastore, urls_to_import, extras, tags, tag_uuids)
+            if result['failure_count'] == 0:
+                # Preserve the long-standing successful response shape.
+                return result['added'], 200
+
+            # The legacy UUID-list response cannot describe partial persistence. Use a
+            # per-item result only when at least one URL failed.
+            status_code = 207 if result['success_count'] else 500
+            return result, status_code
 
         # For large imports (>= 20), process in background thread
         else:
             import threading
-            from loguru import logger
-
             def import_watches_background():
                 """Background thread to import watches - discarded after completion."""
                 try:
-                    added_count = 0
-                    for url in urls_to_import:
-                        try:
-                            self.datastore.add_watch(url=url, extras=extras, tag=tags, tag_uuids=tag_uuids)
-                            added_count += 1
-                        except Exception as e:
-                            logger.error(f"Error importing URL {url}: {e}")
-
-                    logger.info(f"Background import complete: {added_count} watches created")
+                    result = _import_watch_batch(self.datastore, urls_to_import, extras, tags, tag_uuids)
+                    logger.info(
+                        f"Background import {result['status']}: requested={result['requested_count']} "
+                        f"persisted={result['success_count']} failed={result['failure_count']}"
+                    )
+                    for failure in result['failed']:
+                        logger.error(
+                            f"Background import failed for {failure['url']} "
+                            f"(UUID: {failure['uuid']}): {failure['error']}; "
+                            f"cleanup_complete={failure['cleanup_complete']}"
+                        )
                 except Exception as e:
-                    logger.error(f"Error in background import: {e}")
+                    logger.error(f"Background import stopped after {type(e).__name__}")
 
             # Start background thread and return immediately
             thread = threading.Thread(target=import_watches_background, daemon=True, name="ImportWatches-Background")
             thread.start()
 
-            return {'status': f'Importing {len(urls_to_import)} URLs in background', 'count': len(urls_to_import)}, 202
+            return {
+                'status': f'Importing {len(urls_to_import)} URLs in background',
+                'count': len(urls_to_import),
+                'queued_count': len(urls_to_import),
+            }, 202

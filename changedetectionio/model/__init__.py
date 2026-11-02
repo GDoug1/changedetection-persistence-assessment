@@ -1,5 +1,7 @@
 import os
 import uuid
+from threading import RLock
+from contextlib import nullcontext
 
 from changedetectionio import strtobool
 from .persistence import EntityPersistenceMixin, _determine_entity_type
@@ -11,6 +13,13 @@ from ..browser_steps.browser_steps import browser_steps_get_valid_steps
 
 USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH = 'System default'
 CONDITIONS_MATCH_LOGIC_DEFAULT = 'ALL'
+
+
+def _rebuild_watch_model_for_pickle(cls):
+    """Construct a dict-subclass model with its lock ready for item restoration."""
+    instance = cls.__new__(cls)
+    instance._mutation_lock = RLock()
+    return instance
 
 
 class watch_base(dict):
@@ -157,11 +166,25 @@ class watch_base(dict):
     """
 
     def __init__(self, *arg, **kw):
+        # Processor-specific model recasts share the original watch's lock.
+        previous_model = kw.get('default')
+        self._mutation_lock = getattr(previous_model, '_mutation_lock', None) or RLock()
+        self._history_generation = getattr(previous_model, '_history_generation', 0)
+        self._check_generation = getattr(previous_model, '_check_generation', 0)
+        self._configuration_generation = getattr(previous_model, '_configuration_generation', 0)
+
         # Store datastore reference (common to Watch and Tag)
         # Use single underscore to avoid name mangling issues in subclasses
         self._datastore = kw.get('__datastore')
         if kw.get('__datastore'):
             del kw['__datastore']
+
+        # Keep the owning store separately from its legacy dict view. The owner
+        # supplies the lock and mapping used to reject stale runtime commits.
+        previous_model = kw.get('default')
+        self._datastore_owner = kw.pop('__datastore_owner', None) or getattr(
+            previous_model, '_datastore_owner', None
+        )
 
         # Store datastore_path (common to Watch and Tag)
         self._datastore_path = kw.get('datastore_path')
@@ -335,11 +358,9 @@ class watch_base(dict):
 
         Internal method used by __setitem__, update(), pop(), etc.
         """
-        # Don't track edits during initial load or if already edited
+        # Don't track edits during initial load.
         if not hasattr(self, '_watch_base__watch_was_edited'):
             return
-        if self.__watch_was_edited:
-            return  # Already marked as edited
 
         # __-prefixed keys are transient in-memory state (e.g. __check_status set by
         # set_watch_minitext_status). They never persist to disk and must not trigger
@@ -357,6 +378,7 @@ class watch_base(dict):
         if (key not in get_readonly_watch_fields()
                 and key != 'last_viewed'
                 and key not in SYSTEM_MANAGED_NON_SPEC_FIELDS):
+            self._configuration_generation += 1
             self.__watch_was_edited = True
 
     def _intern_shared_values(self):
@@ -376,53 +398,57 @@ class watch_base(dict):
 
         Only sets the edited flag when field is NOT in readonly_fields (from OpenAPI spec).
         """
-        if key in INTERNED_WATCH_KEYS:
-            value = intern_frozen(value)
-        # Set the value first (always)
-        super().__setitem__(key, value)
-        # Mark as edited if writable field
-        self._mark_field_as_edited(key)
+        with self._mutation_lock:
+            if key in INTERNED_WATCH_KEYS:
+                value = intern_frozen(value)
+            # Set the value first (always)
+            super().__setitem__(key, value)
+            # Mark as edited if writable field
+            self._mark_field_as_edited(key)
 
     def __delitem__(self, key):
         """Override dict.__delitem__ to track deletions of writable fields."""
-        super().__delitem__(key)
-        self._mark_field_as_edited(key)
+        with self._mutation_lock:
+            super().__delitem__(key)
+            self._mark_field_as_edited(key)
 
     def update(self, *args, **kwargs):
-
-        if args and args[0].get('browser_steps'):
-            args[0]['browser_steps'] = browser_steps_get_valid_steps(args[0].get('browser_steps'))
-
         """Override dict.update() to track modifications to writable fields."""
-        # Call parent update first
-        super().update(*args, **kwargs)
-        self._intern_shared_values()
+        with self._mutation_lock:
+            if args and args[0].get('browser_steps'):
+                args[0]['browser_steps'] = browser_steps_get_valid_steps(args[0].get('browser_steps'))
 
-        # Mark as edited for any writable fields that were updated
-        # Handle both update(dict) and update(key=value) forms
-        if args:
-            for key in args[0].keys():
+            # Call parent update first
+            super().update(*args, **kwargs)
+            self._intern_shared_values()
+
+            # Mark as edited for any writable fields that were updated
+            # Handle both update(dict) and update(key=value) forms
+            if args:
+                for key in args[0].keys():
+                    self._mark_field_as_edited(key)
+            for key in kwargs.keys():
                 self._mark_field_as_edited(key)
-        for key in kwargs.keys():
-            self._mark_field_as_edited(key)
 
 
     def pop(self, key, *args):
         """Override dict.pop() to track removal of writable fields."""
-        result = super().pop(key, *args)
-        self._mark_field_as_edited(key)
-        return result
+        with self._mutation_lock:
+            result = super().pop(key, *args)
+            self._mark_field_as_edited(key)
+            return result
 
     def setdefault(self, key, default=None):
         """Override dict.setdefault() to track modifications to writable fields."""
         # Only marks as edited if key didn't exist (i.e., a new value was set)
-        existed = key in self
-        if key in INTERNED_WATCH_KEYS:
-            default = intern_frozen(default)
-        result = super().setdefault(key, default)
-        if not existed:
-            self._mark_field_as_edited(key)
-        return result
+        with self._mutation_lock:
+            existed = key in self
+            if key in INTERNED_WATCH_KEYS:
+                default = intern_frozen(default)
+            result = super().setdefault(key, default)
+            if not existed:
+                self._mark_field_as_edited(key)
+            return result
 
     @property
     def was_edited(self):
@@ -434,13 +460,48 @@ class watch_base(dict):
         """
         return getattr(self, '_watch_base__watch_was_edited', False)
 
+    @property
+    def mutation_lock(self):
+        """Per-watch re-entrant lock for mutation, persistence, and rollback sequences."""
+        return self._mutation_lock
+
+    def snapshot_for_rollback(self):
+        """Capture persisted fields and transient edit state while holding the watch lock."""
+        import copy
+
+        with self._mutation_lock:
+            return {
+                'data': copy.deepcopy(dict(self)),
+                'was_edited': self.was_edited,
+                'pending_favicon_clear': getattr(self, '_pending_favicon_clear', False),
+                'history_generation': self._history_generation,
+                'check_generation': self._check_generation,
+                'configuration_generation': self._configuration_generation,
+                'watch_result_transaction_id': getattr(self, '_watch_result_transaction_id', None),
+            }
+
+    def restore_after_failed_commit(self, snapshot):
+        """Restore watch data and transient state after a failed atomic commit."""
+        with self._mutation_lock:
+            dict.clear(self)
+            dict.update(self, snapshot['data'])
+            self.__watch_was_edited = snapshot['was_edited']
+            self._history_generation = snapshot['history_generation']
+            self._check_generation = snapshot['check_generation']
+            self._configuration_generation = snapshot['configuration_generation']
+            if hasattr(self, '_pending_favicon_clear'):
+                self._pending_favicon_clear = snapshot['pending_favicon_clear']
+            if hasattr(self, '_watch_result_transaction_id'):
+                self._watch_result_transaction_id = snapshot.get('watch_result_transaction_id')
+
     def reset_watch_edited_flag(self):
         """
         Reset the watch edited flag after successful processing.
 
         Call this after processing completes to allow future content-only change detection.
         """
-        self.__watch_was_edited = False
+        with self._mutation_lock:
+            self.__watch_was_edited = False
 
     @classmethod
     def get_property_names(cls):
@@ -498,6 +559,7 @@ class watch_base(dict):
         cls = self.__class__
         new_obj = cls.__new__(cls)
         memo[id(self)] = new_obj
+        new_obj._mutation_lock = self._mutation_lock
 
         # Copy the dict data (all the settings)
         for key, value in self.items():
@@ -515,6 +577,8 @@ class watch_base(dict):
                     # Special handling: Share references to large objects instead of copying
                     # Examples: _datastore, __datastore, __app_reference, __global_settings, etc.
                     if (attr_name == '_datastore' or
+                        attr_name == '_datastore_owner' or
+                        attr_name == '_mutation_lock' or
                         attr_name.endswith('__datastore') or
                         attr_name.endswith('__app')):
                         # Share the reference (don't copy!) to prevent memory leaks
@@ -547,6 +611,12 @@ class watch_base(dict):
                     attr_value = getattr(self, attr_name)
                     # Exclude large reference objects and caches from serialization
                     if not (attr_name == '_datastore' or
+                           attr_name == '_datastore_owner' or
+                           attr_name == '_mutation_lock' or
+                            attr_name in {'_history_generation', '_check_generation',
+                                          '_configuration_generation', '_history_clear_transaction_id',
+                                          '_watch_result_transaction_id',
+                                          '_persisted_tag_refs'} or
                            attr_name.endswith('__datastore') or
                            attr_name.endswith('__app') or
                            'cache' in attr_name.lower() or
@@ -560,6 +630,16 @@ class watch_base(dict):
 
         return state
 
+    def __reduce_ex__(self, protocol):
+        """Initialize the mutation lock before pickle restores dict items via __setitem__."""
+        return (
+            _rebuild_watch_model_for_pickle,
+            (self.__class__,),
+            self.__getstate__(),
+            None,
+            iter(dict.items(self)),
+        )
+
     def __setstate__(self, state):
         """
         Custom pickle deserialization for all watch_base subclasses.
@@ -567,6 +647,13 @@ class watch_base(dict):
         WARNING: Large reference objects (like __datastore) are NOT restored!
         Caller must restore these references after unpickling if needed.
         """
+        if not hasattr(self, '_mutation_lock'):
+            self._mutation_lock = RLock()
+
+        for attr_name in ('_history_generation', '_check_generation', '_configuration_generation'):
+            if not hasattr(self, attr_name):
+                setattr(self, attr_name, 0)
+
         # Extract metadata
         metadata = state.pop('__instance_metadata__', {})
 
@@ -594,9 +681,24 @@ class watch_base(dict):
         Common method for both Watch and Tag objects.
         """
         from loguru import logger
+        owner = getattr(self, '_datastore_owner', None)
+        if owner and hasattr(owner, 'is_watch_current'):
+            if not owner.is_watch_current(self.get('uuid'), self):
+                logger.warning(f"Refusing to create data directory for stale or unregistered watch {self.get('uuid')}")
+                return False
+            try:
+                from .Watch import current_check_result
+                active_result = current_check_result()
+            except ImportError:
+                active_result = None
+            if (active_result and active_result[0] is self
+                    and not owner.is_watch_check_token_current(self.get('uuid'), self, active_result[1])):
+                logger.debug(f"Refusing data directory access for stale check result on {self.get('uuid')}")
+                return False
         if not os.path.isdir(self.data_dir):
             logger.debug(f"> Creating data dir {self.data_dir}")
             os.mkdir(self.data_dir)
+        return True
 
     def get_global_setting(self, *path):
         """
@@ -664,28 +766,69 @@ class watch_base(dict):
         Common commit logic for Watch and Tag objects.
         Subclasses override _get_commit_data() and _save_to_disk() for specifics.
 
-        Fire-and-forget: Logs errors but does not raise exceptions.
-        Data remains in memory even if save fails, so next commit will retry.
+        Returns True on success and False on failure. Errors are logged and not raised,
+        so existing fire-and-forget callers may continue to ignore the return value.
         """
+        uuid = self.get('uuid')
+        owner = getattr(self, '_datastore_owner', None)
+        if not owner:
+            from loguru import logger
+            logger.warning(f"Refusing to commit unregistered {self.__class__.__name__} {uuid}: no datastore owner")
+            return False
+
+        entity_type = _determine_entity_type(self.__class__)
+        persisted_tag_refs = getattr(self, '_persisted_tag_refs', None)
+        current_tag_refs = set(self.get('tags') or []) if entity_type == 'watch' else set()
+        tag_refs_changing = (entity_type == 'watch'
+                             and (persisted_tag_refs is None
+                                  or current_tag_refs != persisted_tag_refs))
+        tag_reference_lock = (getattr(owner, '_tag_reference_lock', nullcontext())
+                              if tag_refs_changing else nullcontext())
+
+        # Watch commits share tag-reference serialization with tag deletion. Lock
+        # order is watch -> tag-reference -> datastore; tag deletion never waits
+        # for a watch lock while holding the shared tag-reference lock.
+        with self._mutation_lock:
+            with tag_reference_lock:
+                with owner.lock:
+                    if not owner._is_entity_current_locked(uuid, self):
+                        from loguru import logger
+                        logger.warning(f"Refusing stale commit for {self.__class__.__name__} {uuid}")
+                        return False
+                    if (entity_type == 'watch'
+                            and owner._has_invalid_new_tag_references_locked(self)):
+                        from loguru import logger
+                        logger.warning(f"Refusing watch commit with unregistered tag references: {uuid}")
+                        return False
+                    # URL-change side effects can write watch files and perform their own
+                    # identity check, so run them after releasing the non-reentrant store lock.
+                    saved = self._commit_locked(run_after_commit=False)
+                    if saved and entity_type == 'watch':
+                        self._persisted_tag_refs = set(self.get('tags') or [])
+            if saved:
+                self._after_commit()
+            return saved
+
+    def _commit_locked(self, run_after_commit=True):
         from loguru import logger
 
         if not self.data_dir:
             entity_type = self.__class__.__name__
             logger.error(f"Cannot commit {entity_type} {self.get('uuid')} without datastore_path")
-            return
+            return False
 
         uuid = self.get('uuid')
         if not uuid:
             entity_type = self.__class__.__name__
             logger.error(f"Cannot commit {entity_type} without UUID")
-            return
+            return False
 
         # Get data from subclass (may filter keys)
         try:
             data_dict = self._get_commit_data()
         except Exception as e:
             logger.error(f"Failed to prepare commit data for {uuid}: {e}")
-            return
+            return False
 
         # Save to disk via subclass implementation
         try:
@@ -693,6 +836,14 @@ class watch_base(dict):
             entity_type = _determine_entity_type(self.__class__)
             filename = f"{entity_type}.json"
             self._save_to_disk(data_dict, uuid)
+            if run_after_commit:
+                self._after_commit()
             logger.debug(f"Committed {entity_type} {uuid} to {uuid}/{filename}")
+            return True
         except Exception as e:
             logger.error(f"Failed to commit {uuid}: {e}")
+            return False
+
+    def _after_commit(self):
+        """Optional hook for side effects that must follow successful persistence."""
+        return None

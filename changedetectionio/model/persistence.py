@@ -6,6 +6,18 @@ Provides file-based persistence using atomic writes.
 
 import functools
 import inspect
+import tempfile
+
+
+TOMBSTONE_DIR_PREFIX = '.cdio-tombstone-'
+HISTORY_CLEAR_TRANSACTION_MARKER = '__cdio_history_clear_transaction_id__'
+WATCH_RESULT_TRANSACTION_MARKER = '__cdio_watch_result_transaction_id__'
+WATCH_STORAGE_IDENTITY = '__cdio_watch_storage_identity__'
+
+
+def create_tombstone_dir(parent_dir, kind):
+    """Create a private same-filesystem staging directory ignored by entity loaders."""
+    return tempfile.mkdtemp(prefix=f'{TOMBSTONE_DIR_PREFIX}{kind}-', dir=parent_dir)
 
 
 @functools.lru_cache(maxsize=None)

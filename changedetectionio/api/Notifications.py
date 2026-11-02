@@ -33,16 +33,24 @@ class Notifications(Resource):
             return str(e), 400
 
         added_urls = []
+        save_failed = False
 
         for url in notification_urls:
             clean_url = url.strip()
             added_url = self.datastore.add_notification_url(clean_url)
             if added_url:
                 added_urls.append(added_url)
+            else:
+                save_failed = True
 
         if not added_urls:
+            if save_failed:
+                return {'error': 'Notification settings could not be saved.'}, 500
             return "No valid notification URLs were added", 400
 
+        if save_failed:
+            return {'notification_urls': added_urls,
+                    'error': 'Some notification URLs could not be saved.'}, 207
         return {'notification_urls': added_urls}, 201
     
     @auth.check_token
@@ -62,8 +70,12 @@ class Notifications(Resource):
             return "Invalid input format", 400
 
         clean_urls = [url.strip() for url in notification_urls if isinstance(url, str)]
-        self.datastore.data['settings']['application']['notification_urls'] = clean_urls
-        self.datastore.commit()
+        application = self.datastore.data['settings']['application']
+        previous_urls = list(application.get('notification_urls', []))
+        application['notification_urls'] = clean_urls
+        if not self.datastore.commit():
+            application['notification_urls'] = previous_urls
+            return {'error': 'Notification settings could not be saved.'}, 500
 
         return {'notification_urls': clean_urls}, 200
         
@@ -77,7 +89,9 @@ class Notifications(Resource):
         if not isinstance(urls_to_delete, list):
             abort(400, message="Expected a list of notification URLs.")
 
-        notification_urls = self.datastore.data['settings']['application'].get('notification_urls', [])
+        application = self.datastore.data['settings']['application']
+        previous_urls = list(application.get('notification_urls', []))
+        notification_urls = list(previous_urls)
         deleted = []
 
         for url in urls_to_delete:
@@ -89,8 +103,10 @@ class Notifications(Resource):
         if not deleted:
             abort(400, message="No matching notification URLs found.")
 
-        self.datastore.data['settings']['application']['notification_urls'] = notification_urls
-        self.datastore.commit()
+        application['notification_urls'] = notification_urls
+        if not self.datastore.commit():
+            application['notification_urls'] = previous_urls
+            return {'error': 'Notification settings could not be saved.'}, 500
 
         return 'OK', 204
     

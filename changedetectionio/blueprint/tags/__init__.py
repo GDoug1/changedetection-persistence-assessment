@@ -67,35 +67,54 @@ def construct_blueprint(datastore: ChangeDetectionStore):
     def mute(uuid):
         tag = datastore.data['settings']['application']['tags'].get(uuid)
         if tag:
-            tag['notification_muted'] = not tag['notification_muted']
-            tag.commit()
+            if not datastore.mutate_tag(uuid, lambda current: current.update(
+                    {'notification_muted': not current.get('notification_muted', False)})):
+                flash(gettext("Could not save tag settings."), "error")
         return redirect(url_for('tags.tags_overview_page'))
 
     @tags_blueprint.route("/delete/<uuid_str:uuid>", methods=['POST'])
     @login_optionally_required
     def delete(uuid):
-        # Delete the tag from settings immediately
-        if datastore.data['settings']['application']['tags'].get(uuid):
-            del datastore.data['settings']['application']['tags'][uuid]
+        with datastore.lock:
+            expected_tag = datastore.data['settings']['application']['tags'].get(uuid)
+        if not expected_tag:
+            flash(gettext("Tag not found"), "error")
+            return redirect(url_for('tags.tags_overview_page'))
 
         # Remove tag from all watches in background thread to avoid blocking
-        def remove_tag_background(tag_uuid):
+        def remove_tag_background(tag_uuid, expected_tag):
             """Background thread to remove tag from watches - discarded after completion."""
             removed_count = 0
+            failed = []
             try:
-                for watch_uuid, watch in datastore.data['watching'].items():
-                    if watch.get('tags') and tag_uuid in watch['tags']:
-                        watch['tags'].remove(tag_uuid)
-                        watch.commit()
-                        removed_count += 1
-                logger.info(f"Background: Tag {tag_uuid} removed from {removed_count} watches")
+                with datastore.lock:
+                    watches = list(datastore.data['watching'].items())
+                for watch_uuid, _watch in watches:
+                    changed = []
+                    def unlink(current):
+                        tags = current.get('tags') or []
+                        if tag_uuid not in tags:
+                            return False
+                        current.update({'tags': [t for t in tags if t != tag_uuid]})
+                        changed.append(True)
+                    if datastore.mutate_watch(watch_uuid, unlink):
+                        removed_count += bool(changed)
+                    else:
+                        failed.append(watch_uuid)
+                if failed:
+                    logger.error(f"Background tag deletion {tag_uuid}: {len(failed)} watch saves failed; tag retained")
+                    return
+                if not datastore.delete_tag(tag_uuid, expected_tag=expected_tag):
+                    logger.error(f"Background tag deletion {tag_uuid}: tag changed before final deletion")
+                    return
+                logger.info(f"Background: Tag {tag_uuid} removed from {removed_count} watches and deleted")
             except Exception as e:
-                logger.error(f"Error removing tag from watches: {e}")
+                logger.error(f"Error removing tag {tag_uuid} from watches: {type(e).__name__}")
 
         # Start daemon thread
-        threading.Thread(target=remove_tag_background, args=(uuid,), daemon=True).start()
+        threading.Thread(target=remove_tag_background, args=(uuid, expected_tag), daemon=True).start()
 
-        flash(gettext("Tag deleted, removing from watches in background"))
+        flash(gettext("Removing tag references and configuration in background"))
         return redirect(url_for('tags.tags_overview_page'))
 
     @tags_blueprint.route("/unlink/<uuid_str:uuid>", methods=['POST'])
@@ -105,15 +124,25 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         def unlink_tag_background(tag_uuid):
             """Background thread to unlink tag from watches - discarded after completion."""
             unlinked_count = 0
+            failed = []
             try:
-                for watch_uuid, watch in datastore.data['watching'].items():
-                    if watch.get('tags') and tag_uuid in watch['tags']:
-                        watch['tags'].remove(tag_uuid)
-                        watch.commit()
-                        unlinked_count += 1
-                logger.info(f"Background: Tag {tag_uuid} unlinked from {unlinked_count} watches")
+                with datastore.lock:
+                    watches = list(datastore.data['watching'].items())
+                for watch_uuid, _watch in watches:
+                    changed = []
+                    def unlink(current):
+                        tags = current.get('tags') or []
+                        if tag_uuid not in tags:
+                            return False
+                        current.update({'tags': [t for t in tags if t != tag_uuid]})
+                        changed.append(True)
+                    if datastore.mutate_watch(watch_uuid, unlink):
+                        unlinked_count += bool(changed)
+                    else:
+                        failed.append(watch_uuid)
+                logger.info(f"Background: Tag {tag_uuid} unlink saved for {unlinked_count} watches; failed={len(failed)}")
             except Exception as e:
-                logger.error(f"Error unlinking tag from watches: {e}")
+                logger.error(f"Error unlinking tag {tag_uuid} from watches: {type(e).__name__}")
 
         # Start daemon thread
         threading.Thread(target=unlink_tag_background, args=(uuid,), daemon=True).start()
@@ -125,28 +154,47 @@ def construct_blueprint(datastore: ChangeDetectionStore):
     @login_optionally_required
     def delete_all():
 
-        for tag_uuid in list(datastore.data['settings']['application']['tags'].keys()):
-# TagsDict 'del' handler will remove the dir
-            del datastore.data['settings']['application']['tags'][tag_uuid]
-
-
         # Clear tags from all watches in background thread to avoid blocking
         def clear_all_tags_background():
             """Background thread to clear tags from all watches - discarded after completion."""
             cleared_count = 0
+            failed = []
             try:
-                for watch_uuid, watch in datastore.data['watching'].items():
-                    watch['tags'] = []
-                    watch.commit()
-                    cleared_count += 1
-                logger.info(f"Background: Cleared tags from {cleared_count} watches")
+                with datastore.lock:
+                    watches = list(datastore.data['watching'].items())
+                    tag_objects = dict(datastore.data['settings']['application']['tags'].items())
+                    tag_uuids = list(tag_objects)
+                for watch_uuid, _watch in watches:
+                    if datastore.mutate_watch(watch_uuid, lambda current: current.update({'tags': []})):
+                        cleared_count += 1
+                    else:
+                        failed.append(watch_uuid)
+                if failed:
+                    logger.error(f"Background clear-all-tags: {len(failed)} watch saves failed; tag configurations retained")
+                    return
+                deleted_tags = 0
+                failed_tags = []
+                for tag_uuid in tag_uuids:
+                    try:
+                        if datastore.delete_tag(tag_uuid, expected_tag=tag_objects[tag_uuid]):
+                            deleted_tags += 1
+                        else:
+                            failed_tags.append(tag_uuid)
+                    except OSError:
+                        failed_tags.append(tag_uuid)
+                if failed_tags:
+                    logger.error(f"Background clear-all-tags: deleted {deleted_tags}/{len(tag_uuids)} tags; "
+                                 f"failed {len(failed_tags)}: {', '.join(failed_tags)}")
+                    return
+                logger.info(f"Background: Cleared tag references from {cleared_count} watches and deleted "
+                            f"{deleted_tags}/{len(tag_uuids)} tags")
             except Exception as e:
-                logger.error(f"Error clearing tags from watches: {e}")
+                logger.error(f"Error clearing tags from watches: {type(e).__name__}")
 
         # Start daemon thread
         threading.Thread(target=clear_all_tags_background, daemon=True).start()
 
-        flash(gettext("All tags deleted, clearing from watches in background"))
+        flash(gettext("Removing tags and clearing watch references in background"))
         return redirect(url_for('tags.tags_overview_page'))
 
     @tags_blueprint.route("/edit/<uuid_str:uuid>", methods=['GET'])
@@ -265,9 +313,13 @@ def construct_blueprint(datastore: ChangeDetectionStore):
                 flash(message, 'error')
             return redirect(url_for('tags.form_tag_edit', uuid=uuid))
 
-        tag.update(form.data)
-        tag['processor'] = 'restock_diff'
-        tag.commit()
+        def update_tag(current):
+            current.update(form.data)
+            current['processor'] = 'restock_diff'
+
+        if not datastore.mutate_tag(uuid, update_tag):
+            flash(gettext("Tag settings could not be saved."), "error")
+            return redirect(url_for('tags.form_tag_edit', uuid=uuid))
 
         # Clear checksums for all watches using this tag to force reprocessing
         # Tag changes affect inherited configuration

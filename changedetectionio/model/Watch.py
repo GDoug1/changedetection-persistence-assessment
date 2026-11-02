@@ -32,9 +32,13 @@ from changedetectionio.strtobool import strtobool
 from changedetectionio.jinja2_custom import JINJA2_MARKER_PATTERN, render as jinja_render
 from changedetectionio import gc_debounce
 from . import watch_base
-from .persistence import EntityPersistenceMixin
+from .persistence import (EntityPersistenceMixin, HISTORY_CLEAR_TRANSACTION_MARKER,
+                          WATCH_RESULT_TRANSACTION_MARKER, WATCH_STORAGE_IDENTITY)
 import os
 import re
+import uuid as uuid_builder
+from functools import wraps
+from contextvars import ContextVar
 from pathlib import Path
 from loguru import logger
 
@@ -48,6 +52,41 @@ BROTLI_COMPRESS_SIZE_THRESHOLD = int(os.getenv('SNAPSHOT_BROTLI_COMPRESSION_THRE
 # Keyed by data_dir so it survives Watch object recreation, deepcopy, and concurrent requests.
 # Invalidated explicitly when the favicon is saved or the watch history is cleared.
 _FAVICON_FILENAME_CACHE: dict = {}
+_CURRENT_CHECK_RESULT = ContextVar('changedetection_current_check_result', default=None)
+
+
+def bind_current_check_result(watch, token):
+    return _CURRENT_CHECK_RESULT.set((watch, token))
+
+
+def reset_current_check_result(context_token):
+    if context_token is not None:
+        _CURRENT_CHECK_RESULT.reset(context_token)
+
+
+def current_check_result():
+    return _CURRENT_CHECK_RESULT.get()
+
+
+def _watch_file_locked(method=None, *, write=False):
+    """Serialize watch file access and reject writes through stale watch objects."""
+    def decorate(func):
+        @wraps(func)
+        def locked(self, *args, **kwargs):
+            with self.mutation_lock:
+                owner = getattr(self, '_datastore_owner', None)
+                if write and owner and not owner.is_watch_current(self.get('uuid'), self):
+                    logger.warning(f"Refusing {func.__name__} for stale watch {self.get('uuid')}")
+                    return False
+                active_result = current_check_result()
+                if (write and owner and active_result and active_result[0] is self
+                        and not owner.is_watch_check_token_current(self.get('uuid'), self, active_result[1])):
+                    logger.debug(f"Refusing stale check result file write for watch {self.get('uuid')}")
+                    return False
+                return func(self, *args, **kwargs)
+        return locked
+
+    return decorate(method) if method is not None else decorate
 
 minimum_seconds_recheck_time = int(os.getenv('MINIMUM_SECONDS_RECHECK_TIME', 3))
 mtable = {'seconds': 1, 'minutes': 60, 'hours': 3600, 'days': 86400, 'weeks': 86400 * 7}
@@ -286,9 +325,25 @@ class model(EntityPersistenceMixin, watch_base):
         # Parent class (watch_base) handles __datastore and __datastore_path
         super(model, self).__init__(*arg, **kw)
 
+        self._history_generation = getattr(kw.get('default'), '_history_generation', 0)
+        self._check_generation = getattr(kw.get('default'), '_check_generation', 0)
+        self._configuration_generation = getattr(kw.get('default'), '_configuration_generation', 0)
+        self._history_clear_transaction_id = None
+        self._watch_result_transaction_id = None
+        self._watch_storage_identity = (kw.get('default') or {}).get(WATCH_STORAGE_IDENTITY) or uuid_builder.uuid4().hex
+
+        # A processor-specific model recast keeps a pending URL side effect with the watch.
+        self._pending_favicon_clear = getattr(kw.get('default'), '_pending_favicon_clear', False)
+
         if kw.get('default'):
             self.update(kw['default'])
             del kw['default']
+
+        # These on-disk transaction fields are persistence metadata, not watch
+        # configuration and should not leak into the public watch dictionary.
+        self.pop(WATCH_STORAGE_IDENTITY, None)
+        self.pop(HISTORY_CLEAR_TRANSACTION_MARKER, None)
+        self.pop(WATCH_RESULT_TRANSACTION_MARKER, None)
 
         if self.get('default'):
             del self['default']
@@ -303,20 +358,31 @@ class model(EntityPersistenceMixin, watch_base):
 
         # Be sure the cached timestamp is ready
         bump = self.history
+        self._persisted_tag_refs = set(self.get('tags') or [])
 
     def update(self, *args, **kwargs):
-        """Clear the saved favicon when the URL changes, so the next check fetches the new site's icon.
+        """Schedule favicon invalidation after a URL change has been persisted.
 
         Both the UI edit form and the API save through update(). Only a change from a non-empty URL
         counts - a fresh object starts with url '' and is filled from storage via update() on every
-        load, which must not wipe the favicon.
+        load, which must not wipe the favicon. Keeping the deletion pending avoids losing the cached
+        icon when the corresponding watch.json commit fails.
         """
-        old_url = (self.get('url') or '').strip()
-        super().update(*args, **kwargs)
-        new_url = (self.get('url') or '').strip()
-        if old_url and new_url != old_url:
-            logger.debug(f"UUID: {self.get('uuid')} URL changed from '{old_url}' to '{new_url}', clearing favicon")
-            self.clear_favicon()
+        with self.mutation_lock:
+            old_url = (self.get('url') or '').strip()
+            super().update(*args, **kwargs)
+            new_url = (self.get('url') or '').strip()
+            if old_url and new_url != old_url:
+                self._pending_favicon_clear = True
+
+    def _after_commit(self):
+        if self._pending_favicon_clear:
+            try:
+                self.clear_favicon()
+            except Exception as e:
+                logger.warning(f"UUID: {self.get('uuid')} could not clear cached favicon after URL update: {e}")
+            finally:
+                self._pending_favicon_clear = False
 
     # Note: __deepcopy__, __getstate__, and __setstate__ are inherited from watch_base
     # This prevents memory leaks by sharing __datastore reference instead of copying it
@@ -413,22 +479,7 @@ class model(EntityPersistenceMixin, watch_base):
             return f'history-{processor}.txt'
 
     def clear_watch(self):
-        import pathlib
-
-        # Get list of processor config files to preserve
-        from changedetectionio.processors import find_processors
-        processor_names = [name for cls, name in find_processors()]
-        processor_config_files = {f"{name}.json" for name in processor_names}
-
-        # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
-        # But preserve processor config files (they're configuration, not history data)
-        # Use glob not rglob here for safety.
-        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
-            # Skip processor config files
-            if item.name in processor_config_files:
-                continue
-            os.unlink(item)
-
+        """Reset persisted check state; the datastore stages history files first."""
         _FAVICON_FILENAME_CACHE.pop(self.data_dir, None)
 
         # Force the attr to recalculate
@@ -448,10 +499,6 @@ class model(EntityPersistenceMixin, watch_base):
             'remote_server_reply': None,
             'track_ldjson_price_data': None
         })
-        watch_check_update = signal('watch_check_update')
-        if watch_check_update:
-            watch_check_update.send(watch_uuid=self.get('uuid'))
-
         return
 
     @property
@@ -551,6 +598,7 @@ class model(EntityPersistenceMixin, watch_base):
         return self.__history_n
 
     @property
+    @_watch_file_locked
     def history(self):
         """History index is just a text file as a list
             {watch-uuid}/history.txt
@@ -673,6 +721,7 @@ class model(EntityPersistenceMixin, watch_base):
         # When the 'last viewed' timestamp is less than the oldest snapshot, return oldest
         return sorted_keys[-1]
 
+    @_watch_file_locked
     def get_history_snapshot(self, timestamp=None, filepath=None):
         """
         Accepts either timestamp or filepath
@@ -737,6 +786,7 @@ class model(EntityPersistenceMixin, watch_base):
             tmp_path = tmp.name
         os.replace(tmp_path, dest)
 
+    @_watch_file_locked(write=True)
     def history_trim(self, newest_n_items):
         from pathlib import Path
         import gc
@@ -773,11 +823,13 @@ class model(EntityPersistenceMixin, watch_base):
 
     # Save some text file to the appropriate path and bump the history
     # result_obj from fetch_site_status.run()
-    def save_history_blob(self, contents, timestamp, snapshot_id):
+    @_watch_file_locked(write=True)
+    def save_history_blob(self, contents, timestamp, snapshot_id, *, append_index=True):
 
         logger.trace(f"{self.get('uuid')} - Updating {self.history_index_filename} with timestamp {timestamp}")
 
-        self.ensure_data_dir_exists()
+        if not self.ensure_data_dir_exists():
+            return False
         skip_brotli = strtobool(os.getenv('DISABLE_BROTLI_TEXT_SNAPSHOT', 'False'))
 
         # Binary data - detect file type and save without compression
@@ -824,18 +876,8 @@ class model(EntityPersistenceMixin, watch_base):
                 dest = os.path.join(self.data_dir, snapshot_fname)
                 self._write_atomic(dest, contents.encode('utf-8'))
 
-        # Append to history.txt atomically
-        index_fname = os.path.join(self.data_dir, self.history_index_filename)
-        index_line = f"{timestamp},{snapshot_fname}\n"
-
-        with open(index_fname, 'a', encoding='utf-8') as f:
-            f.write(index_line)
-            f.flush()
-            os.fsync(f.fileno())
-
-        # Update internal state
-        self.__newest_history_key = timestamp
-        self.__history_n += 1
+        if append_index:
+            self.append_history_index_entry(timestamp, snapshot_fname)
 
         # MANUAL CHAIN RESOLUTION: Watch → Global
         # With Pydantic, this would become: maxlen = watch.resolved_history_snapshot_max_length
@@ -850,6 +892,17 @@ class model(EntityPersistenceMixin, watch_base):
 
         # @todo bump static cache of the last timestamp so we dont need to examine the file to set a proper ''viewed'' status
         return snapshot_fname
+
+    @_watch_file_locked(write=True)
+    def append_history_index_entry(self, timestamp, snapshot_fname):
+        """Atomically append one committed snapshot reference to this watch's history index."""
+        index_fname = os.path.join(self.data_dir, self.history_index_filename)
+        previous = Path(index_fname).read_bytes() if os.path.isfile(index_fname) else b''
+        entry = f"{timestamp},{snapshot_fname}\n".encode('utf-8')
+        self._write_atomic(index_fname, previous + entry)
+        self.__newest_history_key = str(timestamp)
+        self.__history_n += 1
+        return True
 
     @property
     def has_empty_checktime(self):
@@ -958,6 +1011,7 @@ class model(EntityPersistenceMixin, watch_base):
         # Also in the case that the file didnt exist
         return True
 
+    @_watch_file_locked(write=True)
     def bump_favicon(self, url, favicon_base_64: str, mime_type: str = None) -> None:
         from urllib.parse import urlparse
         import base64
@@ -1048,6 +1102,7 @@ class model(EntityPersistenceMixin, watch_base):
         # @todo - Store some checksum and only write when its different
         logger.debug(f"UUID: {self.get('uuid')} updated favicon to at {fname}")
 
+    @_watch_file_locked(write=True)
     def clear_favicon(self) -> None:
         """Remove any saved favicon.* so favicon_is_expired() reports it missing and it gets refetched."""
         import glob
@@ -1207,9 +1262,11 @@ class model(EntityPersistenceMixin, watch_base):
             logger.debug(f"LLM cached diff summary '{fname}' FOUND")
             return f.read().strip()
 
+    @_watch_file_locked(write=True)
     def save_llm_diff_summary(self, summary: str, from_version, to_version, prompt: str = ''):
         """Persist the AI Change Summary keyed by version pair + prompt hash."""
-        self.ensure_data_dir_exists()
+        if not self.ensure_data_dir_exists():
+            return False
         prompt_hash = self._llm_summary_prompt_hash(prompt)
         fname = os.path.join(self.data_dir, f'change-summary-{from_version}-to-{to_version}-{prompt_hash}.txt')
         tmp = fname + '.tmp'
@@ -1263,6 +1320,14 @@ class model(EntityPersistenceMixin, watch_base):
             if not k.startswith('processor_config_') and not k.startswith('__')
         }
 
+        transaction_id = getattr(self, '_history_clear_transaction_id', None)
+        if transaction_id:
+            watch_dict[HISTORY_CLEAR_TRANSACTION_MARKER] = transaction_id
+        result_transaction_id = getattr(self, '_watch_result_transaction_id', None)
+        if result_transaction_id:
+            watch_dict[WATCH_RESULT_TRANSACTION_MARKER] = result_transaction_id
+        watch_dict[WATCH_STORAGE_IDENTITY] = self._watch_storage_identity
+
         # Normalize browser_steps: if no meaningful steps, save as empty list
         if not self.has_browser_steps:
             watch_dict['browser_steps'] = []
@@ -1284,6 +1349,7 @@ class model(EntityPersistenceMixin, watch_base):
         return []
 
 
+    @_watch_file_locked(write=True)
     def extract_regex_from_all_history(self, regex):
         import csv
         import re
@@ -1342,12 +1408,14 @@ class model(EntityPersistenceMixin, watch_base):
         # None is set
         return False
 
+    @_watch_file_locked(write=True)
     def save_error_text(self, contents):
         self.ensure_data_dir_exists()
         target_path = os.path.join(self.data_dir, "last-error.txt")
         with open(target_path, 'w', encoding='utf-8') as f:
             f.write(contents)
 
+    @_watch_file_locked(write=True)
     def save_xpath_data(self, data, as_error=False):
         import json
         import zlib
@@ -1367,6 +1435,7 @@ class model(EntityPersistenceMixin, watch_base):
             f.close()
 
     # Save as PNG, PNG is larger but better for doing visual diff in the future
+    @_watch_file_locked(write=True)
     def save_screenshot(self, screenshot: bytes, as_error=False):
 
         if as_error:
@@ -1381,6 +1450,7 @@ class model(EntityPersistenceMixin, watch_base):
             f.close()
 
 
+    @_watch_file_locked
     def get_last_fetched_text_before_filters(self):
         import brotli
         filepath = os.path.join(self.data_dir, 'last-fetched.br')
@@ -1396,18 +1466,22 @@ class model(EntityPersistenceMixin, watch_base):
         with open(filepath, 'rb') as f:
             return(brotli.decompress(f.read()).decode('utf-8'))
 
+    @_watch_file_locked(write=True)
     def save_last_text_fetched_before_filters(self, contents):
         import brotli
         filepath = os.path.join(self.data_dir, 'last-fetched.br')
         _brotli_save(contents, filepath, mode=brotli.MODE_TEXT, fallback_uncompressed=False)
 
+    @_watch_file_locked(write=True)
     def save_last_fetched_html(self, timestamp, contents):
-        self.ensure_data_dir_exists()
+        if not self.ensure_data_dir_exists():
+            return False
         snapshot_fname = f"{timestamp}.html.br"
         filepath = os.path.join(self.data_dir, snapshot_fname)
         _brotli_save(contents, filepath, mode=None, fallback_uncompressed=True)
         self._prune_last_fetched_html_snapshots()
 
+    @_watch_file_locked
     def get_fetched_html(self, timestamp):
         import brotli
 
@@ -1420,15 +1494,18 @@ class model(EntityPersistenceMixin, watch_base):
         return False
 
 
+    @_watch_file_locked(write=True)
     def save_last_fetched_pdf(self, timestamp, contents):
         """Keep the original PDF for a snapshot (the snapshot itself is only the converted text),
         so the newest two versions can be compared. Does nothing unless contents is a PDF."""
         if not isinstance(contents, bytes) or b'%PDF' not in contents[:1024]:
             return
-        self.ensure_data_dir_exists()
+        if not self.ensure_data_dir_exists():
+            return False
         self._write_atomic(os.path.join(self.data_dir, f"{timestamp}.pdf"), contents)
         self._prune_last_fetched_pdf_snapshots()
 
+    @_watch_file_locked
     def get_fetched_pdf(self, timestamp):
         filepath = os.path.join(self.data_dir, f"{timestamp}.pdf")
         if os.path.isfile(filepath):

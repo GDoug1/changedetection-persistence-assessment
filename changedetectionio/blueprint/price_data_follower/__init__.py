@@ -17,18 +17,21 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q: PriorityQueue
     @price_data_follower_blueprint.route("/<uuid_str:uuid>/accept", methods=['POST'])
     @login_optionally_required
     def accept(uuid):
-        datastore.data['watching'][uuid]['track_ldjson_price_data'] = PRICE_DATA_TRACK_ACCEPT
-        datastore.data['watching'][uuid]['processor'] = 'restock_diff'
-        datastore.data['watching'][uuid].clear_watch()
-        datastore.data['watching'][uuid].commit()
+        def accept_price_tracking(watch):
+            watch['track_ldjson_price_data'] = PRICE_DATA_TRACK_ACCEPT
+            watch['processor'] = 'restock_diff'
+
+        if not datastore.clear_watch_history(uuid, mutation=accept_price_tracking):
+            flash("Could not save this watch update or clear its history. It may have been deleted.", "error")
+            return redirect(url_for("watchlist.index"))
         worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
         return redirect(url_for("watchlist.index"))
 
     @price_data_follower_blueprint.route("/<uuid_str:uuid>/reject", methods=['POST'])
     @login_optionally_required
     def reject(uuid):
-        datastore.data['watching'][uuid]['track_ldjson_price_data'] = PRICE_DATA_TRACK_REJECT
-        datastore.data['watching'][uuid].commit()
+        if not datastore.mutate_watch(uuid, lambda watch: watch.update({'track_ldjson_price_data': PRICE_DATA_TRACK_REJECT})):
+            flash("Could not save this watch update. It may have been deleted.", "error")
         return redirect(url_for("watchlist.index"))
 
 

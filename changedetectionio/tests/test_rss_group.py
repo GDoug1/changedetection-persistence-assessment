@@ -149,7 +149,7 @@ def test_rss_group(client, live_server, measure_memory_usage, datastore_path):
     # Clean up
     delete_all_watches(client)
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
 
 def test_rss_group_empty_tag(client, live_server, measure_memory_usage, datastore_path):
@@ -184,7 +184,7 @@ def test_rss_group_empty_tag(client, live_server, measure_memory_usage, datastor
 
     # Clean up
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data
 
 
 def test_rss_group_only_unviewed(client, live_server, measure_memory_usage, datastore_path):
@@ -259,4 +259,4 @@ def test_rss_group_only_unviewed(client, live_server, measure_memory_usage, data
     # Clean up
     delete_all_watches(client)
     res = client.post(url_for("tags.delete_all"), follow_redirects=True)
-    assert b'All tags deleted' in res.data
+    assert b'Removing tags and clearing watch references in background' in res.data

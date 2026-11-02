@@ -19,22 +19,11 @@ def register_watch_operation_handlers(socketio, datastore):
                 emit('operation_result', {'success': False, 'error': 'Missing operation or UUID'})
                 return
             
-            # Check if watch exists
-            if not datastore.data['watching'].get(uuid):
-                emit('operation_result', {'success': False, 'error': 'Watch not found'})
-                return
-            
-            watch = datastore.data['watching'][uuid]
-            
-            # Perform the operation
+            # Perform pause/mute under the shared watch mutation + persistence guard.
             if op == 'pause':
-                watch.toggle_pause()
-                watch.commit()
-                logger.info(f"Socket.IO: Toggled pause for watch {uuid}")
+                saved = datastore.mutate_watch(uuid, lambda watch: watch.toggle_pause())
             elif op == 'mute':
-                watch.toggle_mute()
-                watch.commit()
-                logger.info(f"Socket.IO: Toggled mute for watch {uuid}")
+                saved = datastore.mutate_watch(uuid, lambda watch: watch.toggle_mute())
             elif op == 'recheck':
                 # Import here to avoid circular imports
                 from changedetectionio.flask_app import update_q
@@ -43,9 +32,17 @@ def register_watch_operation_handlers(socketio, datastore):
                 
                 worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
                 logger.info(f"Socket.IO: Queued recheck for watch {uuid}")
+                saved = True
             else:
                 emit('operation_result', {'success': False, 'error': f'Unknown operation: {op}'})
                 return
+
+            if not saved:
+                emit('operation_result', {'success': False, 'error': 'Watch was not saved or no longer exists'})
+                return
+
+            if op in ('pause', 'mute'):
+                logger.info(f"Socket.IO: Toggled {op} for watch {uuid}")
             
             # Send signal to update UI
             watch_check_update = signal('watch_check_update')

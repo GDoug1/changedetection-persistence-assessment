@@ -91,9 +91,24 @@ class Watch(Resource):
     def get(self, uuid):
         """Get information about a single watch, recheck, pause, or mute."""
         # Get watch reference first (for pause/mute operations)
-        watch_obj = self.datastore.data['watching'].get(uuid)
+        with self.datastore.lock:
+            watch_obj = self.datastore.data['watching'].get(uuid)
         if not watch_obj:
             abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+
+        def commit_toggle(action):
+            with watch_obj.mutation_lock:
+                if not self.datastore.is_watch_current(uuid, watch_obj):
+                    abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+                previous_watch_state = watch_obj.snapshot_for_rollback()
+                action()
+                if not watch_obj.commit():
+                    watch_obj.restore_after_failed_commit(previous_watch_state)
+                    return {
+                        'error': 'Watch settings could not be saved.',
+                        'watch_saved': False,
+                    }, 500
+                return "OK", 200
 
         # Create a dict copy for JSON response (with lock for thread safety)
         # This is much faster than deepcopy and doesn't copy the datastore reference
@@ -107,21 +122,13 @@ class Watch(Resource):
             worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
             return "OK", 200
         if request.args.get('paused', '') == 'paused':
-            watch_obj.pause()
-            watch_obj.commit()
-            return "OK", 200
+            return commit_toggle(watch_obj.pause)
         elif request.args.get('paused', '') == 'unpaused':
-            watch_obj.unpause()
-            watch_obj.commit()
-            return "OK", 200
+            return commit_toggle(watch_obj.unpause)
         if request.args.get('muted', '') == 'muted':
-            watch_obj.mute()
-            watch_obj.commit()
-            return "OK", 200
+            return commit_toggle(watch_obj.mute)
         elif request.args.get('muted', '') == 'unmuted':
-            watch_obj.unmute()
-            watch_obj.commit()
-            return "OK", 200
+            return commit_toggle(watch_obj.unmute)
 
         # Return without history, get that via another API call
         # Properties are not returned as a JSON, so add the required props manually
@@ -146,14 +153,16 @@ class Watch(Resource):
         if not self.datastore.data['watching'].get(uuid):
             abort(400, message='No watch exists with the UUID of {}'.format(uuid))
 
-        self.datastore.delete(uuid)
+        if not self.datastore.delete(uuid):
+            return {'error': 'Watch could not be deleted from storage.', 'watch_deleted': False}, 500
         return 'OK', 204
 
     @auth.check_token
     @validate_openapi_request('updateWatch')
     def put(self, uuid):
         """Update watch information."""
-        watch = self.datastore.data['watching'].get(uuid)
+        with self.datastore.lock:
+            watch = self.datastore.data['watching'].get(uuid)
         if not watch:
             abort(404, message='No watch exists with the UUID of {}'.format(uuid))
 
@@ -247,14 +256,29 @@ class Watch(Resource):
             return f"Unknown field(s): {', '.join(sorted(unknown_fields))}", 400
 
         # Update watch with regular (non-processor-config) fields
-        watch.update(json_data)
-        # The request alone can be valid but leave no interval once merged, e.g. nulling the
-        # interval of a watch that already has time_between_check_use_default=False
-        watch.ensure_valid_time_between_check()
-        watch.commit()
+        with watch.mutation_lock:
+            if not self.datastore.is_watch_current(uuid, watch):
+                abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+            previous_watch_state = watch.snapshot_for_rollback()
+            watch.update(json_data)
+            # The request alone can be valid but leave no interval once merged, e.g. nulling the
+            # interval of a watch that already has time_between_check_use_default=False
+            watch.ensure_valid_time_between_check()
+            if not watch.commit():
+                watch.restore_after_failed_commit(previous_watch_state)
+                return {
+                    'error': 'Watch settings could not be saved. Processor configuration was not attempted.',
+                    'watch_saved': False,
+                    'processor_config_saved': None,
+                }, 500
 
-        # Save processor config to JSON file
-        processors.save_processor_config(self.datastore, uuid, processor_config_data)
+            # Save processor config to JSON file
+            if not processors.save_processor_config(self.datastore, uuid, processor_config_data):
+                return {
+                    'error': 'Watch settings were saved, but processor configuration could not be saved.',
+                    'watch_saved': True,
+                    'processor_config_saved': False,
+                }, 500
 
         return "OK", 200
 
@@ -286,7 +310,8 @@ class WatchHistory(Resource):
 
         # Same call as the UI "Clear history" button - wipes snapshots/screenshots and
         # resets last_checked etc, while preserving the watch and its processor config
-        self.datastore.clear_watch_history(uuid)
+        if not self.datastore.clear_watch_history(uuid):
+            return {'error': 'Watch history could not be cleared.', 'watch_saved': False}, 500
         return 'OK', 204
 
 
@@ -566,11 +591,38 @@ class CreateWatch(Resource):
             current_watch_count = len(self.datastore.data['watching'])
             return f"Watch limit reached ({current_watch_count}/{self.datastore.watch_limit} watches). Cannot add more watches.", 429
 
-        new_uuid = self.datastore.add_watch(url=url, extras=extras, tag=tags)
+        new_uuid, watch_saved, cleanup_complete = self.datastore.add_watch(
+            url=url,
+            extras=extras,
+            tag=tags,
+            save_immediately=True,
+            return_commit_status=True,
+        )
+
+        if new_uuid and not watch_saved:
+            cleanup_message = (
+                'Creation failed and temporary watch data was cleaned up.'
+                if cleanup_complete else
+                'Creation failed; cleanup was incomplete and requires inspection.'
+            )
+            return {
+                'uuid': new_uuid,
+                'error': f'Watch creation failed during initial persistence. {cleanup_message}',
+                'watch_created': False,
+                'watch_saved': False,
+                'processor_config_saved': None,
+                'cleanup_complete': cleanup_complete,
+            }, 500
 
         # Save processor config to separate JSON file
         if new_uuid and processor_config_data:
-            processors.save_processor_config(self.datastore, new_uuid, processor_config_data)
+            if not processors.save_processor_config(self.datastore, new_uuid, processor_config_data):
+                return {
+                    'uuid': new_uuid,
+                    'error': 'The watch was saved, but processor configuration could not be saved.',
+                    'watch_saved': True,
+                    'processor_config_saved': False,
+                }, 500
         if new_uuid:
 # Dont queue because the scheduler will check that it hasnt been checked before anyway
 #            worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': new_uuid}))

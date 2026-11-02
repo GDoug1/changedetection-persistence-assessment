@@ -83,10 +83,21 @@ def construct_notifications_blueprint(datastore: ChangeDetectionStore):
         )
 
         if request.method == 'POST' and form.validate():
+            previous = {field: app_settings.get(field) for field in (
+                'notification_urls', 'notification_title', 'notification_body',
+                'notification_format', 'base_url')}
             for field in ('notification_urls', 'notification_title', 'notification_body',
                           'notification_format', 'base_url'):
                 app_settings[field] = form.data.get(field)
-            datastore.commit()
+            if not datastore.commit():
+                app_settings.update(previous)
+                flash(gettext("Settings could not be saved."), "error")
+                return render_template(
+                    "apprise.html", form=form,
+                    emailprefix=os.getenv('NOTIFICATION_MAIL_BUTTON_PREFIX', False),
+                    extra_notification_token_placeholder_info=datastore.get_unique_notification_tokens_available(),
+                    settings_application=app_settings,
+                )
             flash(gettext("Settings updated."))
             return redirect(url_for('settings.notifications.apprise'))
         elif request.method == 'POST':

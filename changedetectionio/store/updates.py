@@ -199,7 +199,8 @@ class DatastoreUpdatesMixin:
                     latest_update = updates_available[-1] if updates_available else 0
                     logger.info(f"No schema version found and no watches exist - assuming fresh install, setting schema_version to {latest_update}")
                     self.data['settings']['application']['schema_version'] = latest_update
-                    self.commit()
+                    if not self.commit():
+                        raise OSError("Could not persist fresh datastore schema version")
                     return  # No updates needed for fresh install
                 else:
                     # Has watches but no schema version - likely old datastore, run all updates
@@ -231,7 +232,8 @@ class DatastoreUpdatesMixin:
                 else:
                     # Bump the version
                     self.data['settings']['application']['schema_version'] = update_n
-                    self.commit()
+                    if not self.commit():
+                        raise OSError(f"Could not persist schema version after update_{update_n}")
 
                     logger.success(f"Update {update_n} completed")
 
@@ -589,7 +591,8 @@ class DatastoreUpdatesMixin:
         saved_count = 0
         for uuid, watch in self.data['watching'].items():
             try:
-                watch.commit()
+                if not watch.commit():
+                    raise OSError(f"Could not persist watch {uuid}")
                 saved_count += 1
 
                 if saved_count % 100 == 0:
@@ -706,7 +709,8 @@ class DatastoreUpdatesMixin:
                 logger.debug(f"Tag {uuid} tag.json exists, skipping")
                 continue
             try:
-                tag_data.commit()
+                if not tag_data.commit():
+                    raise OSError(f"Could not persist tag {uuid}")
                 saved_count += 1
                 if saved_count % 10 == 0:
                     logger.info(f"  Progress: {saved_count}/{tag_count} tags migrated...")
@@ -744,6 +748,7 @@ class DatastoreUpdatesMixin:
         have processor_config_restock_diff set.
         """
         import json
+        from .file_saving_datastore import save_json_atomic
 
         # --- Watches ---
         for uuid, watch in self.data['watching'].items():
@@ -757,13 +762,41 @@ class DatastoreUpdatesMixin:
             if data_dir:
                 watch.ensure_data_dir_exists()
                 filepath = os.path.join(data_dir, 'restock_diff.json')
-                if not os.path.isfile(filepath):
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        json.dump({'restock_diff': restock_settings}, f, indent=2)
+                target_is_valid = False
+                target_data = None
+                if os.path.isfile(filepath):
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            existing = json.load(f)
+                        target_is_valid = (
+                            isinstance(existing, dict)
+                            and isinstance(existing.get('restock_diff'), dict)
+                        )
+                        if target_is_valid:
+                            target_data = existing
+                    except (OSError, ValueError, TypeError):
+                        target_is_valid = False
+                if target_is_valid:
+                    previous_restock_settings = dict(target_data['restock_diff'])
+                    target_data['restock_diff'].update(restock_settings)
+                else:
+                    target_data = {'restock_diff': restock_settings}
+                    previous_restock_settings = None
+                if (not target_is_valid
+                        or target_data['restock_diff'] != previous_restock_settings):
+                    save_json_atomic(filepath, target_data,
+                                     label=f"Restock configuration for {uuid}")
+                    # Verify the replacement before deleting the legacy source field.
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        written = json.load(f)
+                    if not (isinstance(written, dict)
+                            and written.get('restock_diff') == target_data['restock_diff']):
+                        raise OSError(f"Could not validate migrated Restock configuration for {uuid}")
                     logger.info(f"update_30: migrated restock_settings → {filepath}")
 
             del self.data['watching'][uuid]['restock_settings']
-            watch.commit()
+            if not watch.commit():
+                raise OSError(f"Could not persist migrated watch {uuid}")
 
         # --- Tags ---
         for tag_uuid, tag in self.data['settings']['application']['tags'].items():
@@ -772,7 +805,8 @@ class DatastoreUpdatesMixin:
                 continue
             tag['processor_config_restock_diff'] = restock_settings
             del tag['restock_settings']
-            tag.commit()
+            if not tag.commit():
+                raise OSError(f"Could not persist migrated tag {tag_uuid}")
             logger.info(f"update_30: migrated tag {tag_uuid} restock_settings → processor_config_restock_diff")
 
     def update_31(self):
@@ -869,6 +903,7 @@ class DatastoreUpdatesMixin:
 
             restock.pop('original_price', None)
             restock.pop('prev_price', None)
-            watch.commit()
+            if not watch.commit():
+                raise OSError(f"Could not persist migrated watch {uuid}")
 
 

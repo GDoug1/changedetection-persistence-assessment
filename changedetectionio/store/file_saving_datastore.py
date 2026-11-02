@@ -12,6 +12,7 @@ import os
 import tempfile
 import time
 from loguru import logger
+from changedetectionio.model.persistence import TOMBSTONE_DIR_PREFIX
 
 from .base import DataStore
 from .. import strtobool
@@ -23,9 +24,9 @@ try:
 except ImportError:
     HAS_ORJSON = False
 
-# Fsync configuration: Force file data to disk for crash safety
+# Fsync configuration: request best-effort file and directory sync for crash durability
 # Default False to match legacy behavior (write-and-rename without fsync)
-# Set to True for mission-critical deployments requiring crash consistency
+# Directory fsync support depends on the platform and filesystem.
 FORCE_FSYNC_DATA_IS_CRITICAL = bool(strtobool(os.getenv('FORCE_FSYNC_DATA_IS_CRITICAL', 'False')))
 
 # ============================================================================
@@ -38,7 +39,7 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
 
     Generic helper for saving any JSON data (settings, watches, etc.) with:
     - Atomic write (temp file + rename)
-    - Directory fsync for crash consistency (only for new files)
+    - Directory fsync for new files, and for replacements when critical fsync is enabled
     - Size validation
     - Proper error handling
 
@@ -56,7 +57,6 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
         OSError: If disk is full (ENOSPC) or other I/O error
     """
     # Check if file already exists (before we start writing)
-    # Directory fsync only needed for NEW files to persist the filename
     file_exists = os.path.exists(file_path)
 
     # Ensure parent directory exists
@@ -92,7 +92,15 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
 
         # Write to temp file
         t1 = time.time()
-        os.write(fd, data)
+        data_view = memoryview(data)
+        bytes_written = 0
+        while bytes_written < data_size:
+            remaining_bytes = data_size - bytes_written
+            write_count = os.write(fd, data_view[bytes_written:])
+            if (isinstance(write_count, bool) or not isinstance(write_count, int)
+                    or write_count <= 0 or write_count > remaining_bytes):
+                raise OSError("Write returned no bytes or an invalid count before JSON data was complete")
+            bytes_written += write_count
         write_ms = (time.time() - t1) * 1000
 
         # Optional fsync: Force file data to disk for crash safety
@@ -110,11 +118,10 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
         os.replace(temp_path, file_path)
         rename_ms = (time.time() - t3) * 1000
 
-        # Sync directory to ensure filename metadata is durable
-        # OPTIMIZATION: Only needed for NEW files. Existing files already have
-        # directory entry persisted, so we only need file fsync for data durability.
+        # Sync the directory for new names, and also for replacements when critical
+        # fsync is enabled. Atomic replacement alone does not guarantee crash durability.
         dir_fsync_ms = 0
-        if not file_exists:
+        if not file_exists or FORCE_FSYNC_DATA_IS_CRITICAL:
             try:
                 dir_fd = os.open(parent_dir, os.O_RDONLY)
                 try:
@@ -123,9 +130,11 @@ def save_json_atomic(file_path, data_dict, label="file", max_size_mb=10):
                     dir_fsync_ms = (time.time() - t4) * 1000
                 finally:
                     os.close(dir_fd)
-            except (OSError, AttributeError):
-                # Windows doesn't support fsync on directories
-                pass
+            except (OSError, AttributeError) as e:
+                # Directory fsync is unsupported on some platforms/filesystems. In
+                # that case replacement remains atomic, but crash durability is weaker.
+                if FORCE_FSYNC_DATA_IS_CRITICAL:
+                    logger.warning(f"Could not sync directory metadata for {label}: {e}")
 
         # Log timing breakdown for slow saves
 #        total_ms = serialize_ms + write_ms + file_fsync_ms + rename_ms + dir_fsync_ms
@@ -237,7 +246,7 @@ def iter_entity_dirs(datastore_path):
         with os.scandir(datastore_path) as it:
             for entry in it:
                 try:
-                    if entry.is_dir():
+                    if entry.is_dir() and not entry.name.startswith(TOMBSTONE_DIR_PREFIX):
                         yield entry.name, entry.path
                 except OSError:
                     # Raced with a delete, or a broken symlink - not loadable either way

@@ -21,138 +21,135 @@ def _handle_operations(op, uuids, datastore, worker_pool, update_q, queuedWatchM
     """
     from flask import flash
 
-    # Result feedback - 'success' unless a branch overrides it (e.g. invalid input)
     result_message = None
     result_type = 'success'
+    failed_watch_uuids = []
+
+    def persist(uuid, mutation):
+        if datastore.mutate_watch(uuid, mutation):
+            return True
+        failed_watch_uuids.append(uuid)
+        return False
+
+    def persisted_message(template, succeeded):
+        nonlocal result_type
+        if failed_watch_uuids:
+            result_type = 'error'
+            return gettext("{}: {} succeeded, {} failed to save.").format(
+                template, succeeded, len(failed_watch_uuids)
+            )
+        return gettext(template).format(succeeded)
 
     if op == 'delete':
+        deleted = 0
         for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.delete(uuid)
-        result_message = gettext("{} watches deleted").format(len(uuids))
+            if datastore.delete(uuid):
+                deleted += 1
+            else:
+                failed_watch_uuids.append(uuid)
+        result_message = persisted_message("{} watches deleted", deleted)
 
-    elif op == 'pause':
+    elif op in ('pause', 'unpause', 'mute', 'unmute', 'clear-errors'):
+        field, value = {
+            'pause': ('paused', True), 'unpause': ('paused', False),
+            'mute': ('notification_muted', True), 'unmute': ('notification_muted', False),
+            'clear-errors': ('last_error', False),
+        }[op]
+        succeeded = sum(persist(uuid, lambda watch: watch.update({field: value})) for uuid in uuids)
+        templates = {
+            'pause': "{} watches paused", 'unpause': "{} watches unpaused",
+            'mute': "{} watches muted", 'unmute': "{} watches un-muted",
+            'clear-errors': "{} watches errors cleared",
+        }
+        result_message = persisted_message(templates[op], succeeded)
+
+    elif op == 'mark-viewed':
+        succeeded = 0
         for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid]['paused'] = True
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches paused").format(len(uuids))
+            if datastore.set_last_viewed(uuid, int(time.time()), send_signal=False):
+                succeeded += 1
+            else:
+                failed_watch_uuids.append(uuid)
+        result_message = persisted_message("{} watches updated", succeeded)
 
-    elif op == 'unpause':
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid.strip()]['paused'] = False
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches unpaused").format(len(uuids))
-
-    elif (op == 'mark-viewed'):
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.set_last_viewed(uuid, int(time.time()))
-        result_message = gettext("{} watches updated").format(len(uuids))
-
-    elif (op == 'mark-unviewed'):
-        # Re #4382 - wind last_viewed back to the second-newest snapshot, so the row is unviewed
-        # again and [diff] still opens on the latest change (see get_from_version_based_on_last_viewed).
-        # With fewer than two snapshots there is no change to un-view, so those are skipped.
+    elif op == 'mark-unviewed':
+        # Watches with fewer than two snapshots have nothing to mark unviewed.
         updated = 0
         for uuid in uuids:
-            watch = datastore.data['watching'].get(uuid)
+            with datastore.lock:
+                watch = datastore.data['watching'].get(uuid)
             if watch and watch.history_n >= 2:
                 sorted_keys = sorted(watch.history.keys(), key=lambda x: int(x))
-                datastore.set_last_viewed(uuid, int(sorted_keys[-2]))
-                updated += 1
-        result_message = gettext("{} watches updated").format(updated)
+                if datastore.set_last_viewed(uuid, int(sorted_keys[-2]), send_signal=False):
+                    updated += 1
+                else:
+                    failed_watch_uuids.append(uuid)
+        result_message = persisted_message("{} watches updated", updated)
 
-    elif (op == 'mute'):
+    elif op == 'recheck':
+        queued = 0
         for uuid in uuids:
             if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid]['notification_muted'] = True
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches muted").format(len(uuids))
-
-    elif (op == 'unmute'):
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid]['notification_muted'] = False
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches un-muted").format(len(uuids))
-
-    elif (op == 'recheck'):
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                # Recheck and require a full reprocessing
                 worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
-        result_message = gettext("{} watches queued for rechecking").format(len(uuids))
+                queued += 1
+        result_message = gettext("{} watches queued for rechecking").format(queued)
 
-    elif (op == 'clear-errors'):
+    elif op == 'clear-history':
+        cleared = 0
         for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid]["last_error"] = False
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches errors cleared").format(len(uuids))
+            if datastore.clear_watch_history(uuid):
+                cleared += 1
+            else:
+                failed_watch_uuids.append(uuid)
+        result_message = persisted_message("{} watches cleared/reset.", cleared)
 
-    elif (op == 'clear-history'):
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.clear_watch_history(uuid)
-        result_message = gettext("{} watches cleared/reset.").format(len(uuids))
+    elif op == 'notification-default':
+        from changedetectionio.notification import USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH
 
-    elif (op == 'notification-default'):
-        from changedetectionio.notification import (
-            USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH
-        )
-        for uuid in uuids:
-            if datastore.data['watching'].get(uuid):
-                datastore.data['watching'][uuid]['notification_title'] = None
-                datastore.data['watching'][uuid]['notification_body'] = None
-                datastore.data['watching'][uuid]['notification_urls'] = []
-                datastore.data['watching'][uuid]['notification_format'] = USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH
-                datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches set to use default notification settings").format(len(uuids))
+        def set_notification_defaults(watch):
+            watch.update({
+                'notification_title': None,
+                'notification_body': None,
+                'notification_urls': [],
+                'notification_format': USE_SYSTEM_DEFAULT_NOTIFICATION_FORMAT_FOR_WATCH,
+            })
 
-    elif (op == 'set-fetch-backend'):
-        # extra_data = the chosen fetch backend key (e.g. 'html_requests', 'html_webdriver')
+        succeeded = sum(persist(uuid, set_notification_defaults) for uuid in uuids)
+        result_message = persisted_message("{} watches set to use default notification settings", succeeded)
+
+    elif op == 'set-fetch-backend':
         from changedetectionio import content_fetchers
-        # 'system' = inherit the global default fetch method (resolved at fetch time), same as the edit page
         valid = [f[0] for f in content_fetchers.available_fetchers()] + ['system']
         if extra_data in valid:
-            for uuid in uuids:
-                if datastore.data['watching'].get(uuid):
-                    datastore.data['watching'][uuid]['fetch_backend'] = extra_data
-                    datastore.data['watching'][uuid].commit()
-            result_message = gettext("Browser / fetch method updated on {} watches").format(len(uuids))
+            succeeded = sum(persist(uuid, lambda watch: watch.update({'fetch_backend': extra_data})) for uuid in uuids)
+            result_message = persisted_message("Browser / fetch method updated on {} watches", succeeded)
         else:
             result_message = gettext("Invalid browser / fetch method selected")
             result_type = 'error'
 
-    elif (op == 'set-proxy'):
-        # extra_data = proxy key; '' means the system default proxy
+    elif op == 'set-proxy':
         valid = [''] + (list(datastore.proxy_list.keys()) if datastore.proxy_list else [])
         if (extra_data or '') in valid:
-            for uuid in uuids:
-                if datastore.data['watching'].get(uuid):
-                    datastore.data['watching'][uuid]['proxy'] = (extra_data or '')
-                    datastore.data['watching'][uuid].commit()
-            result_message = gettext("Proxy updated on {} watches").format(len(uuids))
+            succeeded = sum(persist(uuid, lambda watch: watch.update({'proxy': (extra_data or '')})) for uuid in uuids)
+            result_message = persisted_message("Proxy updated on {} watches", succeeded)
         else:
             result_message = gettext("Invalid proxy selected")
             result_type = 'error'
 
-    elif (op == 'assign-tag'):
-        op_extradata = extra_data
-        if op_extradata:
-            tag_uuid = datastore.add_tag(title=op_extradata)
-            if op_extradata and tag_uuid:
-                for uuid in uuids:
-                    if datastore.data['watching'].get(uuid):
-                        # Bug in old versions caused by bad edit page/tag handler
-                        if isinstance(datastore.data['watching'][uuid]['tags'], str):
-                            datastore.data['watching'][uuid]['tags'] = []
+    elif op == 'assign-tag':
+        tag_uuid = datastore.add_tag(title=extra_data) if extra_data else False
+        if tag_uuid:
+            def assign_tag(watch):
+                tags = watch.get('tags')
+                if isinstance(tags, str):
+                    tags = []
+                watch.update({'tags': list(tags or []) + [tag_uuid]})
 
-                        datastore.data['watching'][uuid]['tags'].append(tag_uuid)
-                        datastore.data['watching'][uuid].commit()
-        result_message = gettext("{} watches were tagged").format(len(uuids))
+            succeeded = sum(persist(uuid, assign_tag) for uuid in uuids)
+            result_message = persisted_message("{} watches were tagged", succeeded)
+        else:
+            result_message = gettext("Could not create tag for selected watches")
+            result_type = 'error'
 
     if uuids:
         for uuid in uuids:
@@ -199,11 +196,14 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool, 
     @login_optionally_required
     def clear_watch_history(uuid):
         try:
-            datastore.clear_watch_history(uuid)
+            cleared = datastore.clear_watch_history(uuid)
         except KeyError:
             flash(gettext('Watch not found'), 'error')
         else:
-            flash(gettext("Cleared snapshot history for watch {}").format(uuid))
+            if cleared:
+                flash(gettext("Cleared snapshot history for watch {}").format(uuid))
+            else:
+                flash(gettext("Could not clear snapshot history for watch {}.").format(uuid), 'error')
         return redirect(url_for('watchlist.index'))
 
     @ui_blueprint.route("/clear_history", methods=['GET', 'POST'])
@@ -216,16 +216,27 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool, 
                 # Run in background thread to avoid blocking
                 def clear_history_background():
                     # Capture UUIDs first to avoid race conditions
-                    watch_uuids = list(datastore.data['watching'].keys())
+                    with datastore.lock:
+                        watch_uuids = list(datastore.data['watching'].keys())
                     logger.info(f"Background: Clearing history for {len(watch_uuids)} watches")
+                    cleared_uuids = []
+                    failed_uuids = []
 
                     for uuid in watch_uuids:
                         try:
-                            datastore.clear_watch_history(uuid)
+                            if datastore.clear_watch_history(uuid):
+                                cleared_uuids.append(uuid)
+                            else:
+                                failed_uuids.append(uuid)
                         except Exception as e:
+                            failed_uuids.append(uuid)
                             logger.error(f"Error clearing history for watch {uuid}: {e}")
 
-                    logger.info("Background: Completed clearing history")
+                    if failed_uuids:
+                        logger.error(f"Background: Cleared history for {len(cleared_uuids)}/{len(watch_uuids)} "
+                                     f"watches; failed {len(failed_uuids)}: {', '.join(failed_uuids)}")
+                    else:
+                        logger.info(f"Background: Completed clearing history for {len(cleared_uuids)} watches")
 
                 # Start daemon thread
                 threading.Thread(target=clear_history_background, daemon=True).start()
@@ -292,7 +303,13 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, worker_pool, 
             flash(gettext('The watch by UUID {} does not exist.').format(uuid), 'error')
             return redirect(url_for('watchlist.index'))
 
-        datastore.delete(uuid)
+        if not datastore.delete(uuid):
+            message = (
+                gettext('Some watches could not be deleted from storage.') if uuid == 'all' else
+                gettext('The watch could not be deleted from storage.')
+            )
+            flash(message, 'error')
+            return redirect(url_for('watchlist.index'))
         flash(gettext('Deleted.'))
 
         return redirect(url_for('watchlist.index'))

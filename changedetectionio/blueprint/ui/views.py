@@ -19,9 +19,16 @@ def run_preloaded_first_check(datastore, uuid):
     from changedetectionio.processors import get_processor_module
     from changedetectionio import html_tools
 
-    watch = datastore.data['watching'].get(uuid)
+    with datastore.lock:
+        watch = datastore.data['watching'].get(uuid)
     if not watch:
         return False
+    with watch.mutation_lock:
+        with datastore.lock:
+            if datastore.data['watching'].get(uuid) is not watch:
+                return False
+        check_token = (watch._history_generation, watch._check_generation,
+                       watch._configuration_generation)
 
     try:
         processor_module = get_processor_module(watch.get('processor', 'text_json_diff'))
@@ -41,22 +48,26 @@ def run_preloaded_first_check(datastore, uuid):
         update_obj['content-type'] = str(handler.fetcher.get_all_headers().get('content-type', '') or "").lower()
         update_obj['last_error'] = False
         update_obj['last_checked'] = timestamp
+        if not datastore.apply_watch_result(
+                uuid=uuid, watch=watch, token=check_token, update_obj=update_obj,
+                contents=contents, timestamp=timestamp,
+                snapshot_id=update_obj.get('previous_md5', 'none')):
+            return False
         watch.reset_watch_edited_flag()
-        datastore.update_watch(uuid=uuid, update_obj=update_obj)
-
-        watch.save_history_blob(contents=contents,
-                                timestamp=timestamp,
-                                snapshot_id=update_obj.get('previous_md5', 'none'))
         if handler.fetcher.content:
-            watch.save_last_fetched_html(timestamp=timestamp, contents=handler.fetcher.content)
-        watch.save_last_fetched_pdf(timestamp=timestamp, contents=getattr(handler.fetcher, 'raw_content', None))
+            if watch.save_last_fetched_html(timestamp=timestamp, contents=handler.fetcher.content) is False:
+                return False
+        if watch.save_last_fetched_pdf(timestamp=timestamp,
+                                       contents=getattr(handler.fetcher, 'raw_content', None)) is False:
+            return False
 
         # Page title is shown in the list / used in notifications.
         try:
             if 'html' in update_obj.get('content-type', ''):
                 page_title = html_tools.extract_title(data=handler.fetcher.content)
                 if page_title:
-                    datastore.update_watch(uuid=uuid, update_obj={'page_title': page_title.strip()[:2000]})
+                    if not datastore.update_watch(uuid=uuid, update_obj={'page_title': page_title.strip()[:2000]}):
+                        return False
         except Exception as e:
             logger.debug(f"Add Watch preloaded first-check: title extraction failed for {uuid}: {e}")
 

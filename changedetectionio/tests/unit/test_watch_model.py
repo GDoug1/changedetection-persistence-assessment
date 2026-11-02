@@ -13,6 +13,7 @@ import tempfile
 from copy import deepcopy
 
 from changedetectionio.model import Watch, Tag
+from changedetectionio.store import ChangeDetectionStore
 
 # mostly
 class TestDiffBuilder(unittest.TestCase):
@@ -278,8 +279,9 @@ class TestFaviconFilenameCache(unittest.TestCase):
 
             watch.clear_watch()
 
-            self.assertFalse(os.path.exists(favicon_path))
-            self.assertIsNone(watch.get_favicon_filename())
+            self.assertTrue(os.path.exists(favicon_path))
+            self.assertNotIn(watch.data_dir, _FAVICON_FILENAME_CACHE)
+            self.assertEqual(watch.get_favicon_filename(), 'favicon.ico')
 
 
 class TestFaviconExpiry(unittest.TestCase):
@@ -364,16 +366,23 @@ class TestFaviconExpiry(unittest.TestCase):
         self.assertEqual(watch.get_favicon_filename(), 'favicon.png')
 
     def test_url_change_clears_favicon(self):
-        """#4569 - the old site's icon must not outlive a URL change."""
+        """A URL change keeps the old icon until its metadata commit succeeds."""
         with tempfile.TemporaryDirectory() as datastore_path:
-            watch = self._watch(datastore_path)
-            self._save_favicon(watch)
+            datastore = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+            try:
+                watch_uuid = datastore.add_watch(url='https://example.com')
+                watch = datastore.data['watching'][watch_uuid]
+                self._save_favicon(watch)
 
-            watch.update({'url': 'https://another-site.com'})
+                watch.update({'url': 'https://another-site.com'})
+                self.assertEqual(len(glob.glob(os.path.join(watch.data_dir, 'favicon.*'))), 1)
 
-            self.assertEqual(glob.glob(os.path.join(watch.data_dir, 'favicon.*')), [])
-            self.assertIsNone(watch.get_favicon_filename())
-            self.assertTrue(watch.favicon_is_expired())
+                self.assertTrue(watch.commit())
+                self.assertEqual(glob.glob(os.path.join(watch.data_dir, 'favicon.*')), [])
+                self.assertIsNone(watch.get_favicon_filename())
+                self.assertTrue(watch.favicon_is_expired())
+            finally:
+                datastore.stop_thread = True
 
     def test_same_url_or_other_fields_keep_favicon(self):
         with tempfile.TemporaryDirectory() as datastore_path:

@@ -500,6 +500,8 @@ def accumulate_global_tokens(datastore, tokens: int,
     cost = cost_usd if cost_usd is not None else _estimate_cost_usd(model, input_tokens, output_tokens)
 
     with datastore.lock:
+        previous_llm = datastore.data['settings']['application'].get('llm')
+        previous_llm = dict(previous_llm) if isinstance(previous_llm, dict) else previous_llm
         settings = get_llm_settings(datastore)
 
         # Month rollover: reset monthly counters
@@ -516,7 +518,12 @@ def accumulate_global_tokens(datastore, tokens: int,
         # Round-trip through model_dump so storage stays a plain dict and the schema
         # contract (extra='forbid', type coercion) is re-enforced on every write.
         datastore.data['settings']['application']['llm'] = settings.model_dump()
-        datastore.commit()
+        if not datastore.commit():
+            if previous_llm is None:
+                datastore.data['settings']['application'].pop('llm', None)
+            else:
+                datastore.data['settings']['application']['llm'] = previous_llm
+            logger.error("Could not persist LLM usage counters")
 
 
 def is_global_token_budget_exceeded(datastore) -> bool:

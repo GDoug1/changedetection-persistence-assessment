@@ -74,12 +74,12 @@ class Tag(Resource):
                 return {'status': f'OK, queueing {len(watches_to_queue)} watches in background'}, 202
 
         if request.args.get('muted', '') == 'muted':
-            tag['notification_muted'] = True
-            tag.commit()
+            if not self.datastore.mutate_tag(uuid, lambda current: current.update({'notification_muted': True})):
+                return {'error': 'Tag settings could not be saved.'}, 500
             return "OK", 200
         elif request.args.get('muted', '') == 'unmuted':
-            tag['notification_muted'] = False
-            tag.commit()
+            if not self.datastore.mutate_tag(uuid, lambda current: current.update({'notification_muted': False})):
+                return {'error': 'Tag settings could not be saved.'}, 500
             return "OK", 200
 
         # Filter out Watch-specific runtime fields that don't apply to Tags (yet)
@@ -107,17 +107,52 @@ class Tag(Resource):
     @validate_openapi_request('deleteTag')
     def delete(self, uuid):
         """Delete a tag/group and remove it from all watches."""
-        if not self.datastore.data['settings']['application']['tags'].get(uuid):
+        with self.datastore.lock:
+            tag = self.datastore.data['settings']['application']['tags'].get(uuid)
+            watch_items = list(self.datastore.data['watching'].items())
+        if tag is None:
             abort(400, message='No tag exists with the UUID of {}'.format(uuid))
 
-        # Delete the tag, and any tag reference
-        del self.datastore.data['settings']['application']['tags'][uuid]
+        # Persist every unlink before deleting the tag's configuration directory. If
+        # any write fails, keep the tag so no persisted watch references missing config.
+        failed_watch_uuids = []
+        removed_count = 0
+        for watch_uuid, _watch in watch_items:
+            changed = []
 
-        # Remove tag from all watches
-        for watch_uuid, watch in self.datastore.data['watching'].items():
-            if watch.get('tags') and uuid in watch['tags']:
-                watch['tags'].remove(uuid)
-                watch.commit()
+            def remove_tag(current):
+                tags = current.get('tags') or []
+                if uuid not in tags:
+                    return False
+                current.update({'tags': [tag_uuid for tag_uuid in tags if tag_uuid != uuid]})
+                changed.append(True)
+
+            if self.datastore.mutate_watch(watch_uuid, remove_tag):
+                removed_count += bool(changed)
+            else:
+                failed_watch_uuids.append(watch_uuid)
+
+        if failed_watch_uuids:
+            status_code = 207 if removed_count else 500
+            return {
+                'error': 'Tag references could not all be saved; tag configuration was retained.',
+                'tag_deleted': False,
+                'updated_watch_count': removed_count,
+                'failed_watch_uuids': failed_watch_uuids,
+            }, status_code
+
+        try:
+            tag_deleted = self.datastore.delete_tag(uuid, expected_tag=tag)
+        except OSError:
+            return {
+                'error': 'Tag could not be deleted from storage.',
+                'tag_deleted': False,
+                'updated_watch_count': removed_count,
+                'failed_watch_uuids': [],
+            }, 500
+
+        if not tag_deleted:
+            return {'error': 'Tag could not be deleted because it changed concurrently.', 'tag_deleted': False}, 409
 
         return 'OK', 204
 
@@ -167,8 +202,8 @@ class Tag(Resource):
         if colour_error:
             return colour_error, 400
 
-        tag.update(json_data)
-        tag.commit()
+        if not self.datastore.mutate_tag(uuid, lambda current: current.update(json_data)):
+            return {'error': 'Tag settings could not be saved.'}, 500
 
         # Clear checksums for all watches using this tag to force reprocessing
         # Tag changes affect inherited configuration
@@ -208,8 +243,13 @@ class Tag(Resource):
             if extra:
                 tag = self.datastore.data['settings']['application']['tags'].get(new_uuid)
                 if tag:
-                    tag.update(extra)
-                    tag.commit()
+                    if not self.datastore.mutate_tag(new_uuid, lambda current: current.update(extra)):
+                        return {
+                            'error': 'Tag was created, but additional settings could not be saved.',
+                            'uuid': new_uuid,
+                            'tag_saved': True,
+                            'additional_settings_saved': False,
+                        }, 500
             return {'uuid': new_uuid}, 201
         else:
             return "Invalid or unsupported tag", 400

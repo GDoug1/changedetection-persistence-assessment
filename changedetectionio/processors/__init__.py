@@ -495,7 +495,9 @@ def save_processor_config(datastore, watch_uuid, config_data):
 
         # Use processor name as filename so each processor keeps its own config
         config_filename = f'{processor_name}.json'
-        processor_instance.update_extra_watch_config(config_filename, config_data)
+        if not processor_instance.update_extra_watch_config(config_filename, config_data):
+            logger.error(f"Failed to save processor config to {config_filename} for watch {watch_uuid}")
+            return False
 
         logger.debug(f"Saved processor config to {config_filename}: {config_data}")
         return True
@@ -523,7 +525,14 @@ def get_resolved_processor_config(datastore, watch):
     for tag_uuid in (watch.get('tags') or []):
         tag = tags.get(tag_uuid, {})
         if tag.get('overrides_watch'):
-            return dict(tag.get(f'processor_config_{processor_name}') or {}), f'tag:{tag_uuid}'
+            config_key = f'processor_config_{processor_name}'
+            raw_config = tag.get(config_key)
+            if raw_config is None and config_key not in tag:
+                return {}, f'tag:{tag_uuid}'
+            if not isinstance(raw_config, dict):
+                logger.warning(f"Ignoring non-object tag processor config {config_key} for tag {tag_uuid}")
+                return {}, f'tag:{tag_uuid}'
+            return dict(raw_config), f'tag:{tag_uuid}'
 
     config = {}
     # Same untrusted-name guard as save_processor_config(), the name becomes a filename
@@ -532,8 +541,17 @@ def get_resolved_processor_config(datastore, watch):
         if os.path.isfile(config_path):
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f).get(processor_name) or {}
-            except (json.JSONDecodeError, IOError) as e:
+                    loaded_config = json.load(f)
+                if not isinstance(loaded_config, dict):
+                    logger.warning(f"Ignoring non-object {processor_name}.json for watch {watch.get('uuid')}")
+                else:
+                    resolved_config = loaded_config.get(processor_name) or {}
+                    if isinstance(resolved_config, dict):
+                        config = resolved_config
+                    else:
+                        logger.warning(f"Ignoring non-object {processor_name} settings in "
+                                       f"{processor_name}.json for watch {watch.get('uuid')}")
+            except (json.JSONDecodeError, UnicodeError, IOError) as e:
                 logger.warning(f"Failed to read {processor_name}.json for watch {watch.get('uuid')}: {e}")
 
     return config, 'watch'

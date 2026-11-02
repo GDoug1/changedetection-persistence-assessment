@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import time
+import threading
 from flask import url_for
 from .util import live_server_setup, wait_for_all_checks, delete_all_watches
 import os
@@ -995,6 +996,9 @@ def test_api_import_small_synchronous(client, live_server, measure_memory_usage,
     for uuid in res.json:
         assert uuid in live_server.app.config['DATASTORE'].data['watching'], \
             f"Watch {uuid} should exist immediately after synchronous import"
+        watch = live_server.app.config['DATASTORE'].data['watching'][uuid]
+        with open(os.path.join(watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+            assert json.load(watch_file)['uuid'] == uuid
 
     print(f"\n✓ Successfully created {num_urls} watches synchronously")
 
@@ -1076,6 +1080,171 @@ def test_api_import_large_background(client, live_server, measure_memory_usage, 
     print(f"\n✓ Successfully created {num_urls} watches in background (took {elapsed}s)")
 
 
+def test_api_import_sync_partial_persistence_failure_reports_items_and_reload(client, live_server, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore, file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    base_url = url_for('test_endpoint', _external=True)
+    urls = [f'{base_url}?id=sync-fail', f'{base_url}?id=sync-success']
+    real_save = file_saving_datastore.save_entity_atomic
+
+    def fail_one_watch(*args, **kwargs):
+        data_dict = args[2]
+        if kwargs.get('entity_type') == 'watch' and 'id=sync-fail' in data_dict['url']:
+            raise OSError('simulated imported watch write failure')
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_one_watch)
+    response = client.post(
+        url_for('import') + '?paused=true',
+        data='\n'.join(urls),
+        headers={'x-api-key': api_key},
+    )
+
+    assert response.status_code == 207
+    result = response.json
+    assert result['status'] == 'partial_failure'
+    assert result['requested_count'] == 2
+    assert result['success_count'] == 1
+    assert result['failure_count'] == 1
+    assert len(result['added']) == 1
+    assert len(result['failed']) == 1
+
+    failed_item = result['failed'][0]
+    failed_uuid = failed_item['uuid']
+    from changedetectionio.api.Import import _redact_import_url
+    assert failed_item['url'] == _redact_import_url(urls[0])
+    assert failed_item['cleanup_complete'] is True
+    assert failed_uuid not in datastore.data['watching']
+    assert not os.path.exists(os.path.join(datastore.datastore_path, failed_uuid))
+
+    success_uuid = result['added'][0]
+    success_watch = datastore.data['watching'][success_uuid]
+    with open(os.path.join(success_watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['uuid'] == success_uuid
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert failed_uuid not in reloaded.data['watching']
+        assert success_uuid in reloaded.data['watching']
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_api_import_background_success_reports_persisted_count(client, live_server, datastore_path, monkeypatch):
+    import importlib
+    from changedetectionio.store import ChangeDetectionStore
+
+    import_module = importlib.import_module('changedetectionio.api.Import')
+    monkeypatch.setattr(import_module, 'IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD', 0)
+    real_import_batch = import_module._import_watch_batch
+    completed = threading.Event()
+    batch_result = {}
+
+    def record_batch_result(*args, **kwargs):
+        result = real_import_batch(*args, **kwargs)
+        batch_result.update(result)
+        completed.set()
+        return result
+
+    monkeypatch.setattr(import_module, '_import_watch_batch', record_batch_result)
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    test_url = f"{url_for('test_endpoint', _external=True)}?id=background-success"
+    response = client.post(
+        url_for('import') + '?paused=true',
+        data=test_url,
+        headers={'x-api-key': api_key},
+    )
+
+    assert response.status_code == 202
+    assert response.json['queued_count'] == 1
+    assert completed.wait(10), 'background import did not complete'
+    assert batch_result['status'] == 'completed'
+    assert batch_result['requested_count'] == 1
+    assert batch_result['success_count'] == 1
+    assert batch_result['failure_count'] == 0
+
+    watch_uuid = batch_result['added'][0]
+    watch = datastore.data['watching'][watch_uuid]
+    with open(os.path.join(watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['uuid'] == watch_uuid
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert watch_uuid in reloaded.data['watching']
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_api_import_background_partial_failure_reports_counts_and_reload(client, live_server, datastore_path, monkeypatch):
+    import importlib
+    from changedetectionio.store import ChangeDetectionStore, file_saving_datastore
+
+    import_module = importlib.import_module('changedetectionio.api.Import')
+    monkeypatch.setattr(import_module, 'IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD', 0)
+    real_import_batch = import_module._import_watch_batch
+    completed = threading.Event()
+    batch_result = {}
+
+    def record_batch_result(*args, **kwargs):
+        result = real_import_batch(*args, **kwargs)
+        batch_result.update(result)
+        completed.set()
+        return result
+
+    monkeypatch.setattr(import_module, '_import_watch_batch', record_batch_result)
+    real_save = file_saving_datastore.save_entity_atomic
+
+    def fail_one_watch(*args, **kwargs):
+        data_dict = args[2]
+        if kwargs.get('entity_type') == 'watch' and 'id=background-fail' in data_dict['url']:
+            raise OSError('simulated background watch write failure')
+        return real_save(*args, **kwargs)
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_one_watch)
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    base_url = url_for('test_endpoint', _external=True)
+    urls = [f'{base_url}?id=background-fail', f'{base_url}?id=background-success']
+    response = client.post(
+        url_for('import') + '?paused=true',
+        data='\n'.join(urls),
+        headers={'x-api-key': api_key},
+    )
+
+    assert response.status_code == 202
+    assert response.json['queued_count'] == 2
+    assert completed.wait(10), 'background import did not complete'
+    assert batch_result['status'] == 'partial_failure'
+    assert batch_result['requested_count'] == 2
+    assert batch_result['success_count'] == 1
+    assert batch_result['failure_count'] == 1
+
+    failed_item = batch_result['failed'][0]
+    failed_uuid = failed_item['uuid']
+    from changedetectionio.api.Import import _redact_import_url
+    assert failed_item['url'] == _redact_import_url(urls[0])
+    assert failed_item['cleanup_complete'] is True
+    assert failed_uuid not in datastore.data['watching']
+    assert not os.path.exists(os.path.join(datastore.datastore_path, failed_uuid))
+
+    success_uuid = batch_result['added'][0]
+    success_watch = datastore.data['watching'][success_uuid]
+    with open(os.path.join(success_watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['uuid'] == success_uuid
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert failed_uuid not in reloaded.data['watching']
+        assert success_uuid in reloaded.data['watching']
+    finally:
+        reloaded.stop_thread = True
+
+
 def test_api_restock_processor_config(client, live_server, measure_memory_usage, datastore_path):
     """
     Test that processor_config_restock_diff is accepted by the API for watches using
@@ -1154,6 +1323,616 @@ def test_api_restock_processor_config(client, live_server, measure_memory_usage,
     assert res.status_code == 400, "Unknown fields should be rejected"
     assert (b'Validation failed' in res.data or b'Unknown field' in res.data), \
         "Rejection should come from either the OpenAPI spec validation layer or application field filter"
+
+    delete_all_watches(client)
+
+
+def test_api_restock_processor_config_partial_updates_preserve_siblings(client, live_server):
+    """Restock config PUTs merge provided nested settings, while {} clears the config."""
+    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+    headers = {'content-type': 'application/json', 'x-api-key': api_key}
+
+    res = client.post(
+        url_for("createwatch"),
+        data=json.dumps({
+            "url": test_url,
+            "processor": "restock_diff",
+            "paused": True,
+            "processor_config_restock_diff": {
+                "in_stock_processing": "all_changes",
+                "follow_price_changes": True,
+                "price_change_min": 10.0,
+                "price_change_max": 100.0,
+            }
+        }),
+        headers=headers,
+    )
+    assert res.status_code == 201
+    watch_uuid = res.json['uuid']
+
+    # A partial update to one existing setting must retain its siblings.
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({"processor_config_restock_diff": {"price_change_min": 20.0}}),
+        headers=headers,
+    )
+    assert res.status_code == 200
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    assert res.status_code == 200
+    settings = res.json['processor_config_restock_diff']
+    assert settings == {
+        "in_stock_processing": "all_changes",
+        "follow_price_changes": True,
+        "price_change_min": 20.0,
+        "price_change_max": 100.0,
+    }
+
+    # Adding a setting preserves existing settings, and 0 is retained as an explicit value.
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({"processor_config_restock_diff": {"price_change_threshold_percent": 0}}),
+        headers=headers,
+    )
+    assert res.status_code == 200
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    settings = res.json['processor_config_restock_diff']
+    assert settings['in_stock_processing'] == 'all_changes'
+    assert settings['follow_price_changes'] is True
+    assert settings['price_change_min'] == 20.0
+    assert settings['price_change_max'] == 100.0
+    assert settings['price_change_threshold_percent'] == 0
+
+    # Optional nulls and False are explicit updates, not omissions.
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({
+            "processor_config_restock_diff": {
+                "price_change_min": None,
+                "follow_price_changes": False,
+            }
+        }),
+        headers=headers,
+    )
+    assert res.status_code == 200
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    settings = res.json['processor_config_restock_diff']
+    assert settings['price_change_min'] is None
+    assert settings['follow_price_changes'] is False
+    assert settings['in_stock_processing'] == 'all_changes'
+    assert settings['price_change_max'] == 100.0
+    assert settings['price_change_threshold_percent'] == 0
+
+    # An empty nested object preserves the existing full-clear behavior.
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({"processor_config_restock_diff": {}}),
+        headers=headers,
+    )
+    assert res.status_code == 200
+    res = client.get(url_for("watch", uuid=watch_uuid), headers={'x-api-key': api_key})
+    assert res.json['processor_config_restock_diff'] == {}
+
+    delete_all_watches(client)
+
+
+def test_api_processor_config_save_failure_returns_server_error(client, live_server, monkeypatch):
+    """API create/update requests must not report success when config persistence fails."""
+    from changedetectionio import processors
+
+    api_key = live_server.app.config['DATASTORE'].data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+    headers = {'content-type': 'application/json', 'x-api-key': api_key}
+    monkeypatch.setattr(processors, 'save_processor_config', lambda *args, **kwargs: False)
+
+    res = client.post(
+        url_for("createwatch"),
+        data=json.dumps({
+            "url": test_url,
+            "processor": "restock_diff",
+            "title": "Watch created before config failure",
+            "paused": True,
+            "processor_config_restock_diff": {"follow_price_changes": False},
+        }),
+        headers=headers,
+    )
+    assert res.status_code == 500
+    watch_uuid = res.json['uuid']
+    assert 'could not be saved' in res.json['error']
+    assert res.json['watch_saved'] is True
+    assert res.json['processor_config_saved'] is False
+    datastore = client.application.config['DATASTORE']
+    created_watch = datastore.data['watching'][watch_uuid]
+    with open(os.path.join(created_watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['title'] == "Watch created before config failure"
+
+    res = client.put(
+        url_for("watch", uuid=watch_uuid),
+        data=json.dumps({
+            "title": "Watch fields saved despite config failure",
+            "processor_config_restock_diff": {"price_change_min": 5.0},
+        }),
+        headers=headers,
+    )
+    assert res.status_code == 500
+    assert res.json['watch_saved'] is True
+    assert res.json['processor_config_saved'] is False
+    assert 'Watch settings were saved' in res.json['error']
+    watch = datastore.data['watching'][watch_uuid]
+    with open(os.path.join(watch.data_dir, 'watch.json'), encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['title'] == "Watch fields saved despite config failure"
+
+    delete_all_watches(client)
+
+
+def test_api_put_reports_ordinary_watch_write_failure(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(
+        url=test_url,
+        extras={'processor': 'restock_diff', 'title': 'Original title', 'paused': True},
+    )
+    watch = datastore.data['watching'][uuid]
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    with open(watch_path, 'rb') as watch_file:
+        original_bytes = watch_file.read()
+
+    real_save_entity_atomic = file_saving_datastore.save_entity_atomic
+
+    def fail_watch_save(*args, **kwargs):
+        if kwargs.get('entity_type') == 'watch':
+            raise OSError('simulated watch write failure')
+        return real_save_entity_atomic(*args, **kwargs)
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+    response = client.put(
+        url_for('watch', uuid=uuid),
+        data=json.dumps({
+            'title': 'Unsaved title',
+            'processor_config_restock_diff': {'price_change_min': 12.0},
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+
+    assert response.status_code == 500
+    assert response.json['watch_saved'] is False
+    assert response.json['processor_config_saved'] is None
+    assert 'could not be saved' in response.json['error']
+    assert datastore.data['watching'][uuid]['title'] == 'Original title'
+    with open(watch_path, 'rb') as watch_file:
+        assert watch_file.read() == original_bytes
+    assert not os.path.exists(os.path.join(watch.data_dir, 'restock_diff.json'))
+
+    response = client.get(
+        url_for('watch', uuid=uuid, paused='unpaused'),
+        headers={'x-api-key': api_key},
+    )
+    assert response.status_code == 500
+    assert response.json['watch_saved'] is False
+    assert datastore.data['watching'][uuid]['paused'] is True
+
+    delete_all_watches(client)
+
+
+def test_api_put_failure_rollback_preserves_concurrent_same_watch_update(client, live_server, monkeypatch):
+    """A later update waits for the failing save/rollback, then persists its own state."""
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(url=test_url, extras={'title': 'Original', 'paused': True})
+    watch = datastore.data['watching'][uuid]
+
+    first_commit_entered = threading.Event()
+    let_first_fail = threading.Event()
+    second_waiting_for_lock = threading.Event()
+    responses = {}
+    real_commit = watch.commit
+
+    class ObservedRLock:
+        def __init__(self):
+            self.lock = threading.RLock()
+
+        def __enter__(self):
+            if threading.current_thread().name == 'second-watch-update':
+                second_waiting_for_lock.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self.lock.release()
+
+    watch._mutation_lock = ObservedRLock()
+
+    def controlled_commit():
+        if threading.current_thread().name == 'first-watch-update':
+            first_commit_entered.set()
+            assert let_first_fail.wait(10), 'test did not release the first failing commit'
+            return False
+        return real_commit()
+
+    monkeypatch.setattr(watch, 'commit', controlled_commit)
+    app = client.application
+    endpoint = url_for('watch', uuid=uuid)
+
+    def update_watch(thread_name, title):
+        with app.test_client() as thread_client:
+            response = thread_client.put(
+                endpoint,
+                data=json.dumps({'title': title}),
+                headers={'content-type': 'application/json', 'x-api-key': api_key},
+            )
+            responses[thread_name] = response
+
+    first = threading.Thread(target=update_watch, args=('first', 'First request'), name='first-watch-update')
+    second = threading.Thread(target=update_watch, args=('second', 'Second request'), name='second-watch-update')
+    first.start()
+    assert first_commit_entered.wait(10), 'first request did not reach its commit'
+    second.start()
+    assert second_waiting_for_lock.wait(10), 'second request did not contend for the watch lock'
+    assert watch['title'] == 'First request'
+
+    let_first_fail.set()
+    first.join(10)
+    second.join(10)
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert responses['first'].status_code == 500
+    assert responses['second'].status_code == 200
+
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    with open(watch_path, encoding='utf-8') as watch_file:
+        saved_watch = json.load(watch_file)
+    assert watch['title'] == 'Second request'
+    assert saved_watch['title'] == watch['title']
+
+    delete_all_watches(client)
+
+
+def test_api_rejects_stale_put_and_pause_mute_after_watch_deletion(client, live_server):
+    """Requests that captured a watch before deletion must not recreate it on disk."""
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    datastore_path = datastore.datastore_path
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    app = client.application
+
+    def assert_deleted_watch_request_is_rejected(operation, query_args=None):
+        watch_uuid = datastore.add_watch(
+            url=url_for('test_endpoint', _external=True),
+            extras={'title': 'Before delete', 'paused': True},
+        )
+        watch = datastore.data['watching'][watch_uuid]
+        watch_dir = watch.data_dir
+        at_watch_lock = threading.Event()
+        continue_request = threading.Event()
+        request_thread_name = f'stale-watch-{operation}'
+
+        class RequestGateRLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == request_thread_name:
+                    at_watch_lock.set()
+                    if not continue_request.wait(10):
+                        raise AssertionError('test did not release stale request')
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self.lock.release()
+
+        watch._mutation_lock = RequestGateRLock()
+        endpoint = url_for('watch', uuid=watch_uuid, **(query_args or {}))
+        responses = {}
+
+        def make_request():
+            with app.test_client() as thread_client:
+                if operation == 'put':
+                    responses['response'] = thread_client.put(
+                        endpoint,
+                        data=json.dumps({'title': 'Stale update'}),
+                        headers={'content-type': 'application/json', 'x-api-key': api_key},
+                    )
+                else:
+                    responses['response'] = thread_client.get(
+                        endpoint,
+                        headers={'x-api-key': api_key},
+                    )
+
+        request_thread = threading.Thread(target=make_request, name=request_thread_name)
+        request_thread.start()
+        assert at_watch_lock.wait(10), 'request did not reach the per-watch lock'
+
+        datastore.delete(watch_uuid)
+        assert watch_uuid not in datastore.data['watching']
+        assert not os.path.exists(watch_dir)
+
+        continue_request.set()
+        request_thread.join(10)
+        assert not request_thread.is_alive(), 'stale API request did not finish'
+        assert responses['response'].status_code == 404
+        assert watch_uuid not in datastore.data['watching']
+        assert not os.path.exists(watch_dir)
+
+        reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+        try:
+            assert watch_uuid not in reloaded.data['watching']
+        finally:
+            reloaded.stop_thread = True
+
+    assert_deleted_watch_request_is_rejected('put')
+    assert_deleted_watch_request_is_rejected('pause', {'paused': 'paused'})
+    assert_deleted_watch_request_is_rejected('mute', {'muted': 'muted'})
+
+
+def test_api_delete_reports_watch_storage_failure_without_removing_watch(client, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    watch_uuid = datastore.add_watch(
+        url=url_for('test_endpoint', _external=True),
+        extras={'title': 'Keep on disk', 'paused': True},
+    )
+    watch = datastore.data['watching'][watch_uuid]
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+
+    def fail_delete(_uuid):
+        raise OSError('simulated filesystem deletion failure')
+
+    monkeypatch.setattr(datastore, '_delete_watch', fail_delete)
+    response = client.delete(url_for('watch', uuid=watch_uuid), headers={'x-api-key': api_key})
+
+    assert response.status_code == 500
+    assert response.json['watch_deleted'] is False
+    assert datastore.data['watching'][watch_uuid] is watch
+    assert os.path.isfile(watch_path)
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['watching'][watch_uuid]['title'] == 'Keep on disk'
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_tag_delete_filesystem_failure_returns_error_and_does_not_resurrect(client, datastore_path, monkeypatch):
+    import importlib
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    tag_uuid = datastore.add_tag('Tag delete filesystem failure')
+    tag = datastore.data['settings']['application']['tags'][tag_uuid]
+    tag_path = os.path.join(tag.data_dir, 'tag.json')
+    with open(tag_path, 'rb') as tag_file:
+        original_data = tag_file.read()
+
+    tags_module = importlib.import_module('changedetectionio.model.Tags')
+    real_rename = tags_module.os.rename
+
+    def fail_tag_rename(source, destination):
+        if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(tag.data_dir)):
+            raise OSError('simulated tag rename failure')
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(tags_module.os, 'rename', fail_tag_rename)
+
+    response = client.delete(url_for('tag', uuid=tag_uuid), headers={'x-api-key': api_key})
+
+    assert response.status_code == 500
+    assert response.json['tag_deleted'] is False
+    assert tag_uuid in datastore.data['settings']['application']['tags']
+    with open(tag_path, 'rb') as tag_file:
+        assert tag_file.read() == original_data
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['settings']['application']['tags'][tag_uuid]['title'] == 'Tag delete filesystem failure'
+    finally:
+        reloaded.stop_thread = True
+
+
+def test_api_failed_url_update_preserves_favicon_and_edit_flag(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    old_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(url=old_url, extras={'paused': True})
+    watch = datastore.data['watching'][uuid]
+    watch.reset_watch_edited_flag()
+    favicon_path = os.path.join(watch.data_dir, 'favicon.ico')
+    favicon_bytes = b'cached favicon bytes'
+    with open(favicon_path, 'wb') as favicon_file:
+        favicon_file.write(favicon_bytes)
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    with open(watch_path, 'rb') as watch_file:
+        original_watch_bytes = watch_file.read()
+
+    def fail_watch_save(*_args, **_kwargs):
+        raise OSError('simulated watch write failure')
+
+    monkeypatch.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+    response = client.put(
+        url_for('watch', uuid=uuid),
+        data=json.dumps({'url': 'https://example.com/new-product'}),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+
+    assert response.status_code == 500
+    assert watch['url'] == old_url
+    assert watch.was_edited is False
+    assert watch._pending_favicon_clear is False
+    assert open(favicon_path, 'rb').read() == favicon_bytes
+    with open(watch_path, 'rb') as watch_file:
+        assert watch_file.read() == original_watch_bytes
+
+    delete_all_watches(client)
+
+
+def test_api_post_reports_initial_watch_write_failure(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    existing_uuid = datastore.add_watch(
+        url='https://example.com/existing',
+        extras={'paused': True, 'title': 'Must remain'},
+    )
+    existing_watch = datastore.data['watching'][existing_uuid]
+    existing_path = os.path.join(existing_watch.data_dir, 'watch.json')
+    with open(existing_path, 'rb') as watch_file:
+        existing_bytes = watch_file.read()
+
+    def fail_watch_save(*_args, **kwargs):
+        if kwargs.get('entity_type') == 'watch':
+            raise OSError('simulated watch write failure')
+        raise AssertionError('Unexpected non-watch entity write')
+
+    test_url = url_for('test_endpoint', _external=True)
+    with monkeypatch.context() as patcher:
+        patcher.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+        response = client.post(
+            url_for('createwatch'),
+            data=json.dumps({
+                'url': test_url,
+                'processor': 'restock_diff',
+                'paused': True,
+                'processor_config_restock_diff': {'follow_price_changes': False},
+            }),
+            headers={'content-type': 'application/json', 'x-api-key': api_key},
+        )
+
+    assert response.status_code == 500
+    failed_uuid = response.json['uuid']
+    assert failed_uuid
+    assert response.json['watch_created'] is False
+    assert response.json['watch_saved'] is False
+    assert response.json['processor_config_saved'] is None
+    assert response.json['cleanup_complete'] is True
+    assert 'creation failed' in response.json['error'].lower()
+    assert failed_uuid not in datastore.data['watching']
+    assert not os.path.exists(os.path.join(datastore.datastore_path, failed_uuid))
+    with open(existing_path, 'rb') as watch_file:
+        assert watch_file.read() == existing_bytes
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore.datastore_path, include_default_watches=False)
+    try:
+        assert failed_uuid not in reloaded.data['watching']
+    finally:
+        reloaded.stop_thread = True
+
+    # A retry of the same request is a single successful creation, not completion of
+    # the failed in-memory object from the first attempt.
+    response = client.post(
+        url_for('createwatch'),
+        data=json.dumps({
+            'url': test_url,
+            'processor': 'restock_diff',
+            'paused': True,
+            'processor_config_restock_diff': {'follow_price_changes': False},
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+    assert response.status_code == 201
+    successful_uuid = response.json['uuid']
+    assert successful_uuid != failed_uuid
+    assert sum(watch['url'] == test_url for watch in datastore.data['watching'].values()) == 1
+
+    delete_all_watches(client)
+
+
+def test_api_post_reports_incomplete_cleanup_after_initial_write_failure(client, live_server, monkeypatch):
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    real_rmdir = os.rmdir
+
+    def fail_cleanup(path, *args, **kwargs):
+        if os.path.dirname(os.path.abspath(path)) == os.path.abspath(datastore.datastore_path):
+            raise PermissionError('simulated cleanup failure')
+        return real_rmdir(path, *args, **kwargs)
+
+    def fail_watch_save(*_args, **kwargs):
+        if kwargs.get('entity_type') == 'watch':
+            raise OSError('simulated watch write failure')
+        raise AssertionError('Unexpected non-watch entity write')
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(file_saving_datastore, 'save_entity_atomic', fail_watch_save)
+        patcher.setattr(os, 'rmdir', fail_cleanup)
+        response = client.post(
+            url_for('createwatch'),
+            data=json.dumps({
+                'url': url_for('test_endpoint', _external=True),
+                'processor': 'restock_diff',
+                'paused': True,
+            }),
+            headers={'content-type': 'application/json', 'x-api-key': api_key},
+        )
+
+    assert response.status_code == 500
+    assert response.json['watch_created'] is False
+    assert response.json['watch_saved'] is False
+    assert response.json['cleanup_complete'] is False
+    assert 'cleanup was incomplete' in response.json['error'].lower()
+    failed_uuid = response.json['uuid']
+    assert failed_uuid not in datastore.data['watching']
+    failed_dir = os.path.join(datastore.datastore_path, failed_uuid)
+    assert os.path.isdir(failed_dir)
+    real_rmdir(failed_dir)
+
+    delete_all_watches(client)
+
+
+def test_api_processor_atomic_replace_failure_preserves_config(client, live_server, monkeypatch):
+    from changedetectionio import processors
+    from changedetectionio.store import file_saving_datastore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    test_url = url_for('test_endpoint', _external=True)
+    uuid = datastore.add_watch(url=test_url, extras={'processor': 'restock_diff', 'paused': True})
+    assert processors.save_processor_config(datastore, uuid, {
+        'restock_diff': {'follow_price_changes': True, 'price_change_min': 10.0}
+    })
+    watch = datastore.data['watching'][uuid]
+    watch_path = os.path.join(watch.data_dir, 'watch.json')
+    config_path = os.path.join(watch.data_dir, 'restock_diff.json')
+    with open(config_path, 'rb') as config_file:
+        original_config = config_file.read()
+    real_replace = file_saving_datastore.os.replace
+
+    def fail_processor_replace(source, destination):
+        if os.path.basename(destination) == 'restock_diff.json':
+            raise OSError('simulated processor config replacement failure')
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(file_saving_datastore.os, 'replace', fail_processor_replace)
+    response = client.put(
+        url_for('watch', uuid=uuid),
+        data=json.dumps({
+            'title': 'Watch fields persisted',
+            'processor_config_restock_diff': {'follow_price_changes': False},
+        }),
+        headers={'content-type': 'application/json', 'x-api-key': api_key},
+    )
+
+    assert response.status_code == 500
+    assert response.json['watch_saved'] is True
+    assert response.json['processor_config_saved'] is False
+    assert 'Watch settings were saved' in response.json['error']
+    with open(watch_path, encoding='utf-8') as watch_file:
+        assert json.load(watch_file)['title'] == 'Watch fields persisted'
+    with open(config_path, 'rb') as config_file:
+        assert config_file.read() == original_config
 
     delete_all_watches(client)
 
@@ -1251,6 +2030,151 @@ def test_api_watch_get_returns_resolved_restock_processor_config(client, live_se
         "Tag config should still win after PUT attempted to change watch-level config"
 
     delete_all_watches(client)
+
+
+def test_api_watch_get_non_object_processor_config_fails_closed(client, live_server):
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    uuid = datastore.add_watch(
+        url=url_for('test_endpoint', _external=True),
+        extras={'processor': 'restock_diff', 'paused': True},
+    )
+    watch = datastore.data['watching'][uuid]
+    config_path = os.path.join(watch.data_dir, 'restock_diff.json')
+    with open(config_path, 'w', encoding='utf-8') as config_file:
+        json.dump(['unexpected', 'array'], config_file)
+
+    response = client.get(url_for('watch', uuid=uuid), headers={'x-api-key': api_key})
+
+    assert response.status_code == 200
+    assert response.json['processor_config_restock_diff'] == {}
+    assert response.json['processor_config_restock_diff_source'] == 'watch'
+    with open(config_path, encoding='utf-8') as config_file:
+        assert json.load(config_file) == ['unexpected', 'array']
+
+    delete_all_watches(client)
+
+
+def test_api_watch_get_invalid_tag_processor_config_fails_closed_without_rewrite(client, datastore_path):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    tag_uuid = datastore.add_tag('Malformed processor override')
+    tag = datastore.data['settings']['application']['tags'][tag_uuid]
+    tag.update({
+        'overrides_watch': True,
+        'processor_config_restock_diff': ['unexpected', 'array'],
+    })
+    assert tag.commit() is True
+
+    watch_uuid = datastore.add_watch(
+        url=url_for('test_endpoint', _external=True),
+        extras={'processor': 'restock_diff', 'paused': True, 'tags': [tag_uuid]},
+    )
+    response = client.get(url_for('watch', uuid=watch_uuid), headers={'x-api-key': api_key})
+
+    assert response.status_code == 200
+    assert response.json['processor_config_restock_diff'] == {}
+    assert response.json['processor_config_restock_diff_source'] == f'tag:{tag_uuid}'
+    assert tag['processor_config_restock_diff'] == ['unexpected', 'array']
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert reloaded.data['settings']['application']['tags'][tag_uuid]['processor_config_restock_diff'] == [
+            'unexpected', 'array'
+        ]
+    finally:
+        reloaded.stop_thread = True
+
+    delete_all_watches(client)
+
+
+def test_api_import_errors_and_background_logs_redact_sensitive_url_data(client, monkeypatch):
+    from loguru import logger
+    import importlib
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    secret_url = (
+        'https://assessment-user:assessment-password@example.com/product'
+        '?access_token=assessment-token&signature=private-value'
+    )
+    safe_url = 'https://example.com/product'
+
+    def fail_add_watch(url, **_kwargs):
+        raise OSError(f"write failed for {url}; assessment-password private-value")
+
+    monkeypatch.setattr(datastore, 'add_watch', fail_add_watch)
+    response = client.post(url_for('import'), data=secret_url, headers={'x-api-key': api_key})
+    assert response.status_code == 500
+    assert response.json['failed'][0]['url'] == safe_url
+    assert response.json['failed'][0]['error'] == 'Watch creation failed'
+    public_body = response.get_data(as_text=True)
+    for secret in ('assessment-user', 'assessment-password', 'assessment-token', 'private-value'):
+        assert secret not in public_body
+
+    import_module = importlib.import_module('changedetectionio.api.Import')
+    monkeypatch.setattr(import_module, 'IMPORT_SWITCH_TO_BACKGROUND_THRESHOLD', 0)
+    logged_messages = []
+    log_written = threading.Event()
+
+    def capture_log(message):
+        line = str(message)
+        logged_messages.append(line)
+        if 'Background import failed for' in line:
+            log_written.set()
+
+    handler_id = logger.add(capture_log, format='{message}')
+    try:
+        response = client.post(url_for('import'), data=secret_url, headers={'x-api-key': api_key})
+        assert response.status_code == 202
+        assert log_written.wait(5), 'background import failure was not logged'
+    finally:
+        logger.remove(handler_id)
+
+    combined_logs = '\n'.join(logged_messages)
+    assert safe_url in combined_logs
+    for secret in ('assessment-user', 'assessment-password', 'assessment-token', 'private-value'):
+        assert secret not in combined_logs
+
+
+def test_api_tag_cleanup_does_not_resurrect_watch_deleted_during_unlink(client, datastore_path, monkeypatch):
+    from changedetectionio.store import ChangeDetectionStore
+
+    datastore = client.application.config['DATASTORE']
+    api_key = datastore.data['settings']['application'].get('api_access_token')
+    tag_uuid = datastore.add_tag('Concurrent cleanup')
+    watch_uuid = datastore.add_watch(
+        url=url_for('test_endpoint', _external=True),
+        extras={'paused': True, 'tags': [tag_uuid]},
+    )
+    stale_watch = datastore.data['watching'][watch_uuid]
+    watch_dir = stale_watch.data_dir
+    real_mutate_watch = datastore.mutate_watch
+
+    def delete_then_mutate(uuid, mutation):
+        if uuid == watch_uuid:
+            datastore.delete(uuid)
+        return real_mutate_watch(uuid, mutation)
+
+    monkeypatch.setattr(datastore, 'mutate_watch', delete_then_mutate)
+    response = client.delete(url_for('tag', uuid=tag_uuid), headers={'x-api-key': api_key})
+
+    assert response.status_code == 500
+    assert response.json['tag_deleted'] is False
+    assert tag_uuid in datastore.data['settings']['application']['tags']
+    assert watch_uuid not in datastore.data['watching']
+    assert not os.path.exists(watch_dir)
+    assert stale_watch.commit() is False
+    assert not os.path.exists(watch_dir)
+
+    reloaded = ChangeDetectionStore(datastore_path=datastore_path, include_default_watches=False)
+    try:
+        assert watch_uuid not in reloaded.data['watching']
+        assert tag_uuid in reloaded.data['settings']['application']['tags']
+    finally:
+        reloaded.stop_thread = True
 
 
 def test_api_processor_enum_lists_installed_processors(client, live_server, measure_memory_usage, datastore_path):

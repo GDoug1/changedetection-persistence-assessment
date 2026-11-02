@@ -62,15 +62,26 @@ class difference_detection_processor():
         if not data_dir:
             return
 
-        watch.ensure_data_dir_exists()
-        checksum_file = os.path.join(data_dir, 'last-checksum.txt')
+        from changedetectionio.model.Watch import current_check_result
+        active_result = current_check_result()
+        with watch.mutation_lock:
+            if not self.datastore.is_watch_current(self.watch_uuid, watch):
+                return False
+            if (active_result and active_result[0] is watch
+                    and not self.datastore.is_watch_check_token_current(self.watch_uuid, watch, active_result[1])):
+                return False
+            if not watch.ensure_data_dir_exists():
+                return False
+            checksum_file = os.path.join(data_dir, 'last-checksum.txt')
 
-        try:
-            with open(checksum_file, 'w', encoding='utf-8') as f:
-                f.write(checksum)
-            self.last_raw_content_checksum = checksum
-        except IOError as e:
-            logger.warning(f"Failed to write checksum file for {self.watch_uuid}: {e}")
+            try:
+                with open(checksum_file, 'w', encoding='utf-8') as f:
+                    f.write(checksum)
+                self.last_raw_content_checksum = checksum
+                return True
+            except IOError as e:
+                logger.warning(f"Failed to write checksum file for {self.watch_uuid}: {e}")
+                return False
 
     def read_last_raw_content_checksum(self):
         """
@@ -372,46 +383,82 @@ class difference_detection_processor():
             filename: Name of JSON file (e.g., "visual_ssim_score.json")
             data: Dictionary to serialize as JSON
             merge: If True, merge with existing data; if False, overwrite completely
+
+        Returns:
+            bool: True if the config was saved successfully, False otherwise
         """
         import json
         import os
 
-        watch = self.datastore.data['watching'].get(self.watch_uuid)
-        data_dir = watch.data_dir
-
-        if not data_dir:
-            logger.warning(f"Cannot save extra watch config {filename}: no data_dir")
-            return
-
-        # Ensure directory exists
-        watch.ensure_data_dir_exists()
-
-        filepath = self._resolve_watch_config_path(data_dir, filename)
-        if not filepath:
-            return
-
         try:
-            # If merge is enabled, read existing data first
-            existing_data = {}
-            if merge and os.path.isfile(filepath):
-                try:
-                    with open(filepath, 'r', encoding='utf-8') as f:
-                        existing_data = json.load(f)
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.warning(f"Failed to read existing config for merge: {e}")
+            with self.datastore.lock:
+                watch = self.datastore.data['watching'].get(self.watch_uuid)
+            if not watch:
+                logger.warning(f"Cannot save extra watch config {filename}: watch not found")
+                return False
 
-            # Merge new data with existing
-            if merge:
-                existing_data.update(data)
-                data_to_save = existing_data
-            else:
-                data_to_save = data
+            # Serialize config read-modify-write with watch deletion, snapshots, and
+            # other watch mutations. Keep lock order watch -> datastore.
+            with watch.mutation_lock:
+                with self.datastore.lock:
+                    if self.datastore.data['watching'].get(self.watch_uuid) is not watch:
+                        logger.warning(f"Cannot save extra watch config {filename}: watch is stale")
+                        return False
 
-            # Write the data
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(data_to_save, f, indent=2)
-        except IOError as e:
+                data_dir = watch.data_dir
+                if not data_dir:
+                    logger.warning(f"Cannot save extra watch config {filename}: no data_dir")
+                    return False
+
+                # Ensure directory exists
+                if not watch.ensure_data_dir_exists():
+                    return False
+
+                filepath = self._resolve_watch_config_path(data_dir, filename)
+                if not filepath:
+                    return False
+
+                # If merge is enabled, read existing data first
+                existing_data = {}
+                if merge and os.path.isfile(filepath):
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            loaded_data = json.load(f)
+                            if isinstance(loaded_data, dict):
+                                existing_data = loaded_data
+                            else:
+                                logger.warning(f"Existing config for merge is not an object: {filename}")
+                                return False
+                    except (json.JSONDecodeError, IOError) as e:
+                        logger.warning(f"Failed to read existing config for merge: {e}")
+                        return False
+
+                # Merge new data with existing
+                if merge:
+                    data_to_save = dict(existing_data)
+                    data_to_save.update(data)
+
+                    restock_config = data.get('restock_diff')
+                    # Restock settings are nested; merge one level only. An empty object deliberately
+                    # bypasses this branch so it replaces the whole Restock configuration.
+                    if filename == 'restock_diff.json' and isinstance(restock_config, dict) and restock_config:
+                        existing_restock_config = existing_data.get('restock_diff')
+                        merged_restock_config = (
+                            dict(existing_restock_config) if isinstance(existing_restock_config, dict) else {}
+                        )
+                        merged_restock_config.update(restock_config)
+                        data_to_save['restock_diff'] = merged_restock_config
+                else:
+                    data_to_save = data
+
+                # Import locally to avoid coupling processor initialization to the datastore module.
+                from changedetectionio.store.file_saving_datastore import save_json_atomic
+
+                save_json_atomic(filepath, data_to_save, label=f"processor config {filename}")
+                return True
+        except Exception as e:
             logger.error(f"Failed to write extra watch config {filename}: {e}")
+            return False
 
     def get_raw_document_checksum(self):
         checksum = None

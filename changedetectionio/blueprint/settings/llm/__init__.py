@@ -113,8 +113,15 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
 
         if request.method == 'POST':
             if form.validate():
+                previous_llm = datastore.data['settings']['application'].get('llm')
                 save_llm_form(datastore, form.data.get('llm'))
-                datastore.commit()
+                if not datastore.commit():
+                    if previous_llm is None:
+                        datastore.data['settings']['application'].pop('llm', None)
+                    else:
+                        datastore.data['settings']['application']['llm'] = previous_llm
+                    flash(gettext("Settings could not be saved."), "error")
+                    return redirect(url_for('settings.llm.llm_settings_page'))
                 # AI settings change how checks are evaluated, so reprocess everything (as a /settings save does)
                 datastore.clear_all_last_checksums()
                 flash(gettext("Settings updated."))
@@ -289,13 +296,15 @@ def construct_llm_blueprint(datastore: ChangeDetectionStore):
         # Read existing config, write back a dict that omits the connection fields —
         # so the saved dict no longer has model/api_key/api_base/etc.
         # Toggles, prompts, budgets and counters survive.
-        settings = LLMSettings.model_validate(
-            datastore.data['settings']['application'].get('llm') or {}
-        )
+        previous_llm = datastore.data['settings']['application'].get('llm')
+        settings = LLMSettings.model_validate(previous_llm or {})
         datastore.data['settings']['application']['llm'] = settings.model_dump(
             exclude=set(LLMSettings.CONNECTION_FIELDS)
         )
-        datastore.commit()
+        if not datastore.commit():
+            datastore.data['settings']['application']['llm'] = previous_llm
+            flash(gettext("AI / LLM configuration could not be saved."), 'error')
+            return redirect(url_for('settings.llm.llm_settings_page'))
         flash(gettext("AI / LLM configuration removed."), 'notice')
         return redirect(url_for('settings.llm.llm_settings_page'))
 
